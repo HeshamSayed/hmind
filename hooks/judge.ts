@@ -158,6 +158,10 @@ export type Stats = {
   verificationsFailed: number
   rulesApplied: number
   rulesLearned: number
+  orchestrations: number
+  agentsHeld: number
+  agentsDeduped: number
+  reportsDigested: number
 }
 
 export const emptyStats = (): Stats => ({
@@ -179,6 +183,10 @@ export const emptyStats = (): Stats => ({
   verificationsFailed: 0,
   rulesApplied: 0,
   rulesLearned: 0,
+  orchestrations: 0,
+  agentsHeld: 0,
+  agentsDeduped: 0,
+  reportsDigested: 0,
 })
 
 export async function loadStats($: EngineInterface): Promise<Stats> {

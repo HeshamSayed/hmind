@@ -1,7 +1,7 @@
 {
   "name": "hmind",
-  "version": "0.4.0",
-  "description": "A second brain for Claude Code: guards risky commands, trims noisy output, right-sizes effort per prompt, routes subagents to cheaper models, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost. Every decision logged.",
+  "version": "0.5.0",
+  "description": "A second brain and orchestrator for Claude Code: runs plans of subtasks as parallel subagents on the cheapest adequate model, governs the agents the model launches itself, guards risky commands, trims noisy output, right-sizes effort, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost.",
   "license": "MIT",
   "userConfig": {
     "judgeModel": {
@@ -15,6 +15,48 @@
       "title": "Confidence threshold",
       "description": "Below this confidence (0-1) a judge answer is not acted on",
       "default": 0.75
+    },
+    "orchestrate": {
+      "type": "boolean",
+      "title": "Orchestrate tool",
+      "description": "Offer the orchestrate tool: the model hands Hmind a plan of tasks with dependencies and Hmind runs them as parallel subagents",
+      "default": true
+    },
+    "maxParallel": {
+      "type": "number",
+      "title": "Tasks in parallel",
+      "description": "How many orchestrated tasks run at once (1-8; lowered under budget pressure)",
+      "default": 3
+    },
+    "taskTimeoutMin": {
+      "type": "number",
+      "title": "Task timeout (minutes)",
+      "description": "An orchestrated task that runs longer is stopped and counted as timed out",
+      "default": 10
+    },
+    "retryUp": {
+      "type": "boolean",
+      "title": "Retry a tier up",
+      "description": "Retry a failed, blocked or timed-out task once on the next stronger model",
+      "default": true
+    },
+    "agentCap": {
+      "type": "number",
+      "title": "Agents at once",
+      "description": "Hold a new agent the model launches until fewer than this many are running (0 = no cap; lowered under budget pressure)",
+      "default": 4
+    },
+    "dedupeAgents": {
+      "type": "boolean",
+      "title": "Refuse duplicate agents",
+      "description": "Refuse an agent whose task duplicates one already running, with the running agent's id in the reason",
+      "default": true
+    },
+    "agentReportOver": {
+      "type": "number",
+      "title": "Digest agent reports over",
+      "description": "An agent report longer than this many characters is digested before it reaches the parent; the full text stays available with /hmind report (0 disables)",
+      "default": 6000
     },
     "budgetMode": {
       "type": "boolean",
@@ -68,7 +110,11 @@
       "type": "string",
       "title": "Done check",
       "description": "What to do when a turn claims completion without running any test, build or check",
-      "options": ["off", "toast", "prompt"],
+      "options": [
+        "off",
+        "toast",
+        "prompt"
+      ],
       "default": "toast"
     },
     "autoVerify": {

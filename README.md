@@ -1,9 +1,11 @@
 # Hmind
 
-**A second brain for Claude Code.** Every coding session is full of small judgment calls: is this command safe to run, does this output matter, how hard should the model think about this prompt, which model should this subagent get, is the work really done, is now a good time to compact? Hmind answers them for a few hundred tokens each, acts only when it is sure, and shows you what every model in the session consumed. The result is leaner sessions, fewer wasted tokens, safer hands on the shell, and decisions you can audit.
+**A second brain and an orchestrator for Claude Code.** Every coding session is full of small judgment calls: is this command safe to run, does this output matter, how hard should the model think about this prompt, which model should this subagent get, is the work really done, is now a good time to compact? Hmind answers them for a few hundred tokens each and acts only when it is sure. Hand it a plan and it runs the pieces as parallel subagents on the cheapest adequate model, retries what fails, digests what comes back and prices the run. The result is leaner sessions, fewer wasted tokens, safer hands on the shell, work that fans out without the main model babysitting it, and decisions you can audit.
 
 ## Why you will feel it
 
+- **It orchestrates, so the main model does not have to.** The model writes the plan: tasks with ids, prompts and the ids each one needs. Hmind runs independent tasks at once, each on the cheapest model adequate for its kind (lookups on Haiku, mechanical changes on Sonnet, judgment on the parent model), feeds each task the digested results of the ones it depends on, retries a failed or stalled task once on a stronger model, stops a task that runs past its time, and hands back one digest per task with status, model, tokens and cost. The main model reads a page, not twenty reports.
+- **It keeps the model's own agents in order.** When the model launches agents itself, Hmind caps how many run at once, refuses one that duplicates an agent already running (naming the running one so the model waits for it instead), digests long reports before they re-enter the parent's context, and keeps an account per agent.
 - **Fewer tokens, same work.** Long tool output is trimmed to what the assistant actually needs, or replaced by a digest of the failures when that is what matters. Effort is right-sized to the prompt. The conversation is compacted at natural task boundaries instead of mid-task. Subagents doing lookups or mechanical work run on cheaper models. Context and subagents are where most Claude Code spend goes; Hmind keeps both small.
 - **It tightens when your plan is running low.** Hmind watches your 5-hour and 7-day usage windows. As they fill, it lowers effort on more turns, trims harder, compacts sooner, routes more subagent work to cheaper models, and tells you.
 - **Safer sessions.** A shell command that could wipe data, rewrite shared history or change your system is stopped before it runs, with a reason the model can act on. Approve one and Hmind learns the rule for that project, so it never asks about that shape again.
@@ -24,6 +26,9 @@ Everything fails open: if the judge is unavailable or unsure, Claude Code behave
 | End of a turn | Did the answer claim "done" with no test, build or run this turn? | Toast, push the model to verify, or run the verification yourself |
 | Next prompt after a refusal | Is the user approving the refused command? | Learn an allow rule for that command shape in this project |
 | Next prompt once context is full | Does this prompt start a new task? | Compact at that boundary with keep rules |
+| The model calls `orchestrate` | Which model fits each task, how did each end, what did it say? | Runs the plan in waves, retries a tier up, digests each report, prices the run |
+| The model launches an agent | Is this the work of an agent already running? Is there a slot? | Refuse the duplicate with the running agent's id; hold the launch until a slot frees |
+| An agent reports back | Is the report longer than the parent needs? | Digest it to status, result, files and open points; keep the full text for `/hmind report` |
 | Any time | The model calls `decide` with its own typed questions | Answers with probabilities and confidence |
 | Every model call | Who made it, on which model, at what token cost? | Adds it to the usage ledger (`/hmind usage`) |
 
@@ -34,6 +39,27 @@ Hmind asks typed questions and gets probabilities back, never prose: a **choice*
 Every question goes to a Claude judge model, `haiku` by default, through your own Claude Code session, batched when several questions share one state. The judge reads the whole state with real understanding and answers each question with an option, a confidence and a one-line reason. Hmind acts on an answer only above the confidence threshold (0.75 by default); below it, nothing changes. A judge call is a few hundred tokens, and the ledger shows exactly what they add up to, so the cost of the second brain is never a guess.
 
 There is nothing to install beyond the plugin: no server, no local model, no GPU. Wherever Claude Code runs, Hmind runs.
+
+## Orchestration
+
+The model calls the `orchestrate` tool with a goal and a list of tasks:
+
+```json
+{
+  "goal": "Add rate limiting to the public API",
+  "tasks": [
+    { "id": "routes", "description": "list public routes", "prompt": "List every public route under src/api with its handler file and method.", "kind": "lookup" },
+    { "id": "lib", "description": "pick a limiter", "prompt": "Check package.json and the lockfile: is a rate limiter already a dependency? Report the name and version, or none.", "kind": "lookup" },
+    { "id": "middleware", "description": "write the middleware", "prompt": "Write src/api/rateLimit.ts using the limiter found, keyed by client IP, 100 requests a minute. Export a function usable by every route.", "needs": ["lib"], "kind": "mechanical" },
+    { "id": "wire", "description": "wire every route", "prompt": "Apply the rate-limit middleware to every public route listed. Do not change handler logic.", "needs": ["routes", "middleware"], "kind": "mechanical" },
+    { "id": "tests", "description": "test the limiter", "prompt": "Add tests that the 101st request in a minute from one IP gets 429 and that other IPs are unaffected. Run the suite and report.", "needs": ["wire"], "kind": "judgment" }
+  ]
+}
+```
+
+`routes` and `lib` run at once on Haiku. `middleware` starts when `lib` is in, on Sonnet, with `lib`'s digest in its prompt. `wire` waits for both, `tests` for `wire`, on the parent model. A task that ends failed, blocked, silent or out of time is retried once a tier up with the previous attempt's last lines; a task whose dependency did not finish is skipped and says so. The answer is one digest per task and a cost line: what the run cost and what it would have cost with every task on the parent model. `/hmind runs` lists runs, `/hmind run <id>` shows the full reports, `/hmind agents` every agent of the session with its model, time, tokens and cost.
+
+A task may name a `model` outright (never above the parent) or a `subagentType`. `maxParallel` caps the wave, and budget pressure lowers it on its own. Under high pressure every task runs one at a time.
 
 ## Measured (52 labeled cases, `eval/`)
 
@@ -73,9 +99,10 @@ The eval script needs Node 22.6 or newer (`node --experimental-strip-types` on 2
 
 - `/hmind` stats: decisions, latency, every action taken, labels, budget pressure, rules, and this session's spend in one line.
 - `/hmind usage` the ledger for this session: tokens and list-price cost by who and model (main loop, subagents, subagents Hmind routed cheaper, compaction, Hmind's judge and digest calls), the prompt-cache hit rate, and the savings estimate; `/hmind usage all` across sessions. Prices are list API prices; on a subscription this is plan usage, not a bill.
+- `/hmind agents` every agent of the session: status, model, time, tokens, cost, who launched it. `/hmind runs` the orchestrated runs; `/hmind run <id>` one run with its full reports; `/hmind report <agent>` the full text of a report Hmind digested.
 - `/hmind log` the last 15 decisions with ids; `/hmind right <id>` or `/hmind wrong <id>` to label one and track the judge's accuracy and calibration.
 - `/hmind rules`, `/hmind allow <command>`, `/hmind forget <n>` for the project's allow rules.
 - `/hmind verify on|off` to let Hmind run the project's test or build command after an unverified done claim; `/hmind verify` shows the command it recognised.
 - `/hmind budget` the current pressure; `/hmind off`, `/hmind on`, `/hmind reset`.
 
-Settings live in the config menu under the plugin's name: the judge model, the confidence threshold, thresholds for each action, and each feature on or off.
+Settings live in the config menu under the plugin's name: the judge model, the confidence threshold, tasks in parallel, the task timeout, the agent cap, the report digest threshold, thresholds for each action, and each feature on or off.

@@ -7,7 +7,7 @@ import type { EngineInterface } from 'claude-code'
 import { fmt, money, priceOf, resolveModel, usdOf } from './pricing'
 import type { Usage } from './pricing'
 
-export type Who = 'main' | 'subagent' | 'routed' | 'compact' | 'judge' | 'digest'
+export type Who = 'main' | 'subagent' | 'routed' | 'orchestrated' | 'compact' | 'judge' | 'digest'
 
 export type Line = {
   who: Who
@@ -135,8 +135,9 @@ export async function resetAvoided($: EngineInterface): Promise<void> {
 
 // ---------------------------------------------------------------- text
 
-const WHO_LABEL: Record<Who, string> = { main: 'main loop', subagent: 'subagents', routed: 'routed by Hmind', compact: 'compaction', judge: 'Hmind judge', digest: 'Hmind digest' }
-const ORDER: Who[] = ['main', 'subagent', 'routed', 'compact', 'judge', 'digest']
+const WHO_LABEL: Record<Who, string> = { main: 'main loop', subagent: 'subagents', routed: 'routed by Hmind', orchestrated: 'orchestrated', compact: 'compaction', judge: 'Hmind judge', digest: 'Hmind digest' }
+const ORDER: Who[] = ['main', 'subagent', 'routed', 'orchestrated', 'compact', 'judge', 'digest']
+const CHEAPER = new Set<Who>(['routed', 'orchestrated'])
 
 export type LedgerExtras = { title: string; cliUsd?: number }
 
@@ -145,7 +146,7 @@ export type LedgerSummary = { claudeUsd: number; ownUsd: number; savedUsd: numbe
 export function summarize(l: Ledger): LedgerSummary {
   const lines = Object.values(l.lines)
   const sum = (f: (r: Line) => boolean) => lines.filter(f).reduce((s, r) => s + r.usd, 0)
-  const routedSaved = lines.filter(r => r.who === 'routed').reduce((s, r) => s + r.insteadUsd - r.usd, 0)
+  const routedSaved = lines.filter(r => CHEAPER.has(r.who)).reduce((s, r) => s + r.insteadUsd - r.usd, 0)
   const main = lines.filter(r => r.who === 'main').sort((a, b) => b.calls - a.calls)[0]
   return { claudeUsd: sum(() => true), ownUsd: sum(r => r.who === 'judge' || r.who === 'digest'), savedUsd: l.avoided.usd + routedSaved, mainModel: main?.model ?? '', requests: l.requests }
 }
@@ -159,7 +160,7 @@ export function ledgerText(l: Ledger, x: LedgerExtras): string {
   const s = summarize(l)
   const out = [`${x.title} (since ${l.since.slice(0, 16).replace('T', ' ')})`, row('who', 'model', 'calls', 'input', 'cache write', 'cache read', 'output', 'est. cost')]
   for (const r of lines) {
-    const note = r.who === 'routed' && r.insteadUsd > 0 ? `  (≈ ${money(r.insteadUsd)} on the parent model)` : priceOf(r.model) ? '' : '  (no list price known)'
+    const note = CHEAPER.has(r.who) && r.insteadUsd > r.usd ? `  (≈ ${money(r.insteadUsd)} on the parent model)` : priceOf(r.model) ? '' : '  (no list price known)'
     out.push(row(WHO_LABEL[r.who], r.model, fmt(r.calls), fmt(r.input), fmt(r.cacheWrite), fmt(r.cacheRead), fmt(r.output), money(r.usd)) + note)
   }
   if (lines.length === 0) out.push('  no model calls recorded yet.')
@@ -168,7 +169,7 @@ export function ledgerText(l: Ledger, x: LedgerExtras): string {
   const mainIn = main.reduce((a, r) => a + r.input + r.cacheWrite + r.cacheRead, 0)
   const cached = main.reduce((a, r) => a + r.cacheRead, 0)
   if (mainIn > 0) out.push(`  main loop: ${fmt(l.requests)} requests, ${fmt(mainIn)} input tokens, ${Math.round((cached / mainIn) * 100)}% served from the prompt cache`)
-  const routed = lines.filter(r => r.who === 'routed')
+  const routed = lines.filter(r => CHEAPER.has(r.who))
   const routedUsd = routed.reduce((a, r) => a + r.usd, 0)
   const routedInstead = routed.reduce((a, r) => a + r.insteadUsd, 0)
   const net = s.savedUsd - s.ownUsd

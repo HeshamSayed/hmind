@@ -5,6 +5,25 @@
 
 import type { Question } from './judge'
 
+// ---------------------------------------------------------------- agents
+
+export const dupState = (runningDesc: string, runningPrompt: string, newDesc: string, newPrompt: string) =>
+  `RUNNING AGENT\n  description: ${runningDesc}\n  task: ${runningPrompt.slice(0, 1500) || '(not recorded)'}\n\nNEW AGENT\n  description: ${newDesc}\n  task: ${newPrompt.slice(0, 1500)}`
+
+export const dupQuestion: Question = {
+  id: 'duplicate',
+  type: 'noul',
+  statement:
+    'The NEW agent would do the same work the RUNNING agent is already doing (the same files, the same question, the same change), so starting it duplicates effort rather than adding a distinct piece. ' +
+    'Different files, a different question, a review of the other agent\'s result, or a follow-up step do NOT count as the same work.',
+}
+
+export const OUTCOME_OPTIONS = ['done: the task was completed as asked', 'partial: some of it was done and the rest is stated', 'not done: it was blocked, failed, abandoned, or the report only describes a plan'] as const
+
+export const outcomeState = (task: string, report: string) => `TASK\n${task.slice(0, 2000)}\n\nREPORT\n${report.slice(0, 12000)}`
+
+export const outcomeQuestion: Question = { id: 'outcome', type: 'choice', question: 'Judging by the REPORT, how did the agent end the TASK?', options: OUTCOME_OPTIONS }
+
 export const SIZE_OPTIONS = [
   'a question, a chat message, or a trivial ask: explain, show, list, rename, a one-line fix',
   'a small, clearly specified code change touching one or two files',

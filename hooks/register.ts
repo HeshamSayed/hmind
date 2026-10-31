@@ -8,16 +8,23 @@
 //   5. prompt.submit: compact at a task boundary once context is full; learn allow rules from approvals.
 //   6. agent.spawn: route lookup and mechanical subagent work to cheaper models; warn on needless forks.
 //   7. every model call: a ledger of tokens and list-price cost by who made it and on which model (/hmind usage).
+//   8. orchestrate tool: the model hands over a plan of tasks with dependencies; Hmind runs them as parallel
+//      subagents on the cheapest adequate model, retries failures a tier up, digests the reports, prices the run.
+//   9. the model's own agents: a cap on how many run at once, duplicates refused, long reports digested.
 // Plus a `decide` tool the model can call itself, and `/hmind` for stats, usage and control.
 // Every hook fails open: when the judge is unavailable or unsure, nothing changes.
 
 import type { Register, EngineInterface } from 'claude-code'
 
+import { agentsText, isActive, overlap, waitForSlot } from './agents'
+import type { AgentNote } from './agents'
 import { compactAtFor, describePressure, effortFor, readPressure, trimOverFor } from './budget'
 import type { Effort, Pressure, Size } from './budget'
-import { digest } from './digest'
+import { digest, digestReport } from './digest'
 import { clearLedgers, ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest, resetAvoided, setLedgerSession, summarize, updateLedger } from './ledger'
-import { money } from './pricing'
+import { ZERO, addUsage, loadRuns, makeLauncher, parallelFor, parsePlan, rememberRun, runDetail, runPlan, runText, runsText } from './orchestrate'
+import type { RunCtx, Status, Waiter } from './orchestrate'
+import { money, usdOf } from './pricing'
 import { bumpStats, calibration, clamp, decide, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
 import type { Answer, DecisionRecord, JudgeConfig, Question } from './judge'
 import {
@@ -27,11 +34,15 @@ import {
   boundaryState,
   claimsQuestion,
   claimsState,
+  dupQuestion,
+  dupState,
   forkQuestion,
   gateQuestion,
   gateState,
   needQuestion,
   needState,
+  outcomeQuestion,
+  outcomeState,
   sizeQuestion,
   sizeState,
   spawnQuestion,
@@ -71,6 +82,13 @@ type Options = {
   digest: boolean
   autoVerify: boolean
   learnRules: boolean
+  orchestrate: boolean
+  maxParallel: number
+  taskTimeoutMin: number
+  retryUp: boolean
+  agentCap: number
+  dedupeAgents: boolean
+  agentReportOver: number
 }
 
 /** Everything the hooks share; a hot reload starts it over (trust, rules and stats live in $.store). */
@@ -92,6 +110,16 @@ type Shared = {
   /** requests made per turn, counted at turn.step */
   steps: Map<string, number>
   mainModel: string
+  /** every agent seen this session, by id */
+  agents: Map<string, AgentNote>
+  /** prompts of the agents the orchestrator itself spawned, while they run */
+  ours: Set<string>
+  /** orchestrated agents: agent id -> the parent model they would have run on */
+  orchestrated: Map<string, string>
+  /** orchestrations in flight */
+  runs: number
+  /** orchestrated agents whose report the launcher is waiting for */
+  waiting: Map<string, Waiter>
 }
 
 const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
@@ -125,13 +153,46 @@ async function log($: EngineInterface, kind: string, summary: string, answers: A
   return id
 }
 
+// ------------------------------------------------------------ the model's own agents: a cap and a duplicate check
+
+/** Hold a new agent until a slot frees, and refuse one that duplicates an agent already running. Returns the refusal text, if any. */
+async function govern($: EngineInterface, sh: Shared, e: { description: string; prompt: string }): Promise<string | undefined> {
+  const { opt, cfg } = sh
+  if (opt.agentCap > 0) {
+    const cap = opt.budgetMode ? parallelFor(sh.pressure.level, opt.agentCap) : opt.agentCap
+    const waited = await waitForSlot($, cap, 5 * 60000)
+    if (waited > 2500) {
+      await bumpStats($, s => {
+        s.agentsHeld += 1
+      })
+      $.ui.toast(`Hmind: held "${e.description.slice(0, 40)}" ${Math.round(waited / 1000)} s until an agent slot freed`)
+    }
+  }
+  if (!opt.dedupeAgents) return undefined
+  const active = (await $.agent.list().catch(() => [])).filter(isActive)
+  const mine = `${e.description} ${e.prompt.slice(0, 400)}`
+  const twin = active.map(a => ({ a, note: sh.agents.get(a.id) })).find(({ a, note }) => overlap(mine, `${a.description} ${note?.prompt.slice(0, 400) ?? ''}`) >= 0.35)
+  if (!twin) return undefined
+  const a = await decideOne($, cfg, dupState(twin.a.description, twin.note?.prompt ?? '', e.description, e.prompt), [dupQuestion])
+  await log($, 'duplicate', e.description, [a])
+  if (!usable(a, sh) || a.p === undefined || a.p < 0.85) return undefined
+  await bumpStats($, s => {
+    s.agentsDeduped += 1
+  })
+  $.ui.toast(`Hmind: refused a duplicate agent ("${e.description.slice(0, 40)}" is already running)`)
+  return (
+    `Hmind refused this agent: one is already doing this work ("${twin.a.description}", id ${twin.a.id}). ` +
+    'Wait for its result instead of starting another; if the task really differs, say how in the description and the prompt.'
+  )
+}
+
 // ------------------------------------------------------------ surface
 
-async function registerSurface($: EngineInterface): Promise<void> {
+async function registerSurface($: EngineInterface, withOrchestrate: boolean): Promise<void> {
   await $.command.register({
     name: 'hmind',
     description: 'Hmind: stats, usage and cost by model, decisions, rules, verify, on/off',
-    argumentHint: '[usage [all]|log|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
+    argumentHint: '[usage [all]|agents|runs|run <id>|report <agent>|log|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
   })
   await $.tool.register({
     name: 'decide',
@@ -160,6 +221,41 @@ async function registerSurface($: EngineInterface): Promise<void> {
         },
       },
       required: ['state', 'questions'],
+    },
+    isDeferred: false,
+  })
+  if (!withOrchestrate) return
+  await $.tool.register({
+    name: 'orchestrate',
+    description:
+      'Run a plan of subtasks as parallel subagents. Give the goal and the tasks (id, prompt, optional description, needs = ids it depends on, kind = lookup | mechanical | judgment). ' +
+      'Independent tasks run at once on the cheapest adequate model, each with the digested results of the tasks it needs; a task that fails is retried once on a stronger model; ' +
+      'the answer is one digest per task with status, model and cost. Use it when work splits into independent pieces instead of launching agents one by one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        goal: { type: 'string', description: 'What the whole plan achieves, one or two sentences.' },
+        tasks: {
+          type: 'array',
+          description: 'The tasks, 1 to 24, each self-contained enough for a fresh agent.',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', description: 'Short unique id, e.g. "scan-auth".' },
+              description: { type: 'string', description: '3 to 6 words naming the task.' },
+              prompt: { type: 'string', description: 'The full task for the agent: what to do, where, and what to report.' },
+              needs: { type: 'array', items: { type: 'string' }, description: 'Ids of tasks whose results this one needs; it starts after they finish and sees their digests.' },
+              kind: { type: 'string', enum: ['lookup', 'mechanical', 'judgment'], description: 'lookup: find or read facts; mechanical: a well-specified change; judgment: design, debugging, tradeoffs. Picks the model; omitted, Hmind judges it.' },
+              model: { type: 'string', enum: ['haiku', 'sonnet', 'opus', 'fable'], description: 'Force a model (never above the parent).' },
+              subagentType: { type: 'string', description: 'Agent type, default general-purpose.' },
+            },
+            required: ['id', 'prompt'],
+          },
+        },
+        maxParallel: { type: 'number', description: 'At most this many tasks at once (default from settings, lowered under budget pressure).' },
+        retry: { type: 'boolean', description: 'Retry a failed task once on a stronger model (default true).' },
+      },
+      required: ['goal', 'tasks'],
     },
     isDeferred: false,
   })
@@ -197,13 +293,13 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
   const u = summarize(await loadLedger($, 'session'))
   return [
     `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions by ${cfg.judgeModel} (${s.unanswered} unanswered), avg ${answered ? `${Math.round(s.claudeMs / answered)} ms` : 'n/a'} each`,
-    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings`,
+    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings, ${s.orchestrations} orchestrated runs, ${s.agentsHeld} agents held for a slot, ${s.agentsDeduped} duplicate agents refused, ${s.reportsDigested} agent reports digested`,
     `  labels: ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
     `  budget: ${sh.opt.budgetMode ? describePressure(sh.pressure) || `normal (${sh.pressure.percent}% of the ${sh.pressure.window} window)` : 'budget mode off'}`,
     `  usage this session: Claude ${money(u.claudeUsd)}${u.mainModel ? ` (${u.mainModel}, ${u.requests} requests)` : ''}, Hmind's own calls ${money(u.ownUsd)}, est. ${money(u.savedUsd)} saved at list prices; /hmind usage for the breakdown by model`,
     `  rules: ${sh.rules.filter(r => r.root === sh.root).length} learned for this project; auto-verify ${verifyOn ? 'on' : 'off'} here`,
     `  judge: ${cfg.judgeModel}, confidence threshold ${cfg.confidence}`,
-    '  /hmind usage [all] | log | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
+    '  /hmind usage [all] | agents | runs | run <id> | report <agent> | log | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
   ].join('\n')
 }
 
@@ -267,6 +363,13 @@ export const register: Register = (on, options) => {
       digest: options.digest !== false,
       autoVerify: options.autoVerify === true,
       learnRules: options.learnRules !== false,
+      orchestrate: options.orchestrate !== false,
+      maxParallel: clamp(Number(options.maxParallel ?? 3), 1, 8),
+      taskTimeoutMin: clamp(Number(options.taskTimeoutMin ?? 10), 1, 120),
+      retryUp: options.retryUp !== false,
+      agentCap: Math.max(0, Number(options.agentCap ?? 4)),
+      dedupeAgents: options.dedupeAgents !== false,
+      agentReportOver: Math.max(0, Number(options.agentReportOver ?? 6000)),
     },
     enabled: true,
     wantsCompact: false,
@@ -280,6 +383,11 @@ export const register: Register = (on, options) => {
     routed: new Map(),
     steps: new Map(),
     mainModel: '',
+    agents: new Map(),
+    ours: new Set(),
+    orchestrated: new Map(),
+    runs: 0,
+    waiting: new Map(),
   }
   const { opt } = sh
   let lastLevel = 'normal'
@@ -292,7 +400,7 @@ export const register: Register = (on, options) => {
     sh.rules = await loadRules($)
     const usage = await $.session.usage().catch(() => undefined)
     setLedgerSession(String(usage?.startedAt ?? Date.now()))
-    await registerSurface($)
+    await registerSurface($, opt.orchestrate)
     if (opt.budgetMode) void readPressure($).then(p => (sh.pressure = p)).catch(() => undefined)
     return next(e)
   })
@@ -307,7 +415,12 @@ export const register: Register = (on, options) => {
           scope: 'session',
           text:
             'A `decide` tool (mcp__hmind__decide) answers typed questions about a state you give it: choice, score or yes/no, each with probabilities and a confidence, ' +
-            'served by a Claude judge model. Reach for it when you must classify, rank, route, gate or triage many items, or check a claim quickly, instead of reasoning about each at length.',
+            'served by a Claude judge model. Reach for it when you must classify, rank, route, gate or triage many items, or check a claim quickly, instead of reasoning about each at length.' +
+            (opt.orchestrate
+              ? ' An `orchestrate` tool (mcp__hmind__orchestrate) runs a plan you write as parallel subagents: give it the goal and the tasks with ids, prompts, `needs` (the ids a task depends on) and a kind (lookup, mechanical, judgment). ' +
+                'Hmind runs independent tasks at once on the cheapest adequate model, feeds each task the digested results of the ones it needs, retries a failed task once on a stronger model, and returns one digest per task with its cost. ' +
+                'Use it instead of launching agents one by one when work splits into three or more independent pieces; keep the judgment-heavy work for yourself.'
+              : ''),
         },
       ],
     }
@@ -473,47 +586,140 @@ export const register: Register = (on, options) => {
   // ------------------------------------------------------------ subagents
 
   on('agent.spawn', async ($, e, next) => {
-    if (!sh.enabled || !opt.subagents || e.parentAgentId !== undefined) return next(e)
-    if (e.subagentType === 'fork') {
-      const state = spawnState(e.subagentType, e.description, e.prompt)
-      const a = await decideOne($, cfg, state, [forkQuestion])
-      await log($, 'fork', e.description, [a])
-      if (usable(a, sh) && a.p !== undefined && a.p <= 1 - cfg.confidence) {
-        await bumpStats($, s => {
-          s.forkWarnings += 1
-        })
-        $.ui.toast(`Hmind: this fork copies the whole conversation, but its task looks self-contained (${pct(1 - a.p)}); a general-purpose agent would be far cheaper`)
+    if (!sh.enabled || e.parentAgentId !== undefined) return next(e)
+    const ours = sh.ours.has(e.prompt)
+    let spawn = e
+    let rerouted = false
+    if (!ours && opt.subagents) {
+      const refused = await govern($, sh, e)
+      if (refused) return { deny: refused }
+      if (e.subagentType === 'fork') {
+        const state = spawnState(e.subagentType, e.description, e.prompt)
+        const a = await decideOne($, cfg, state, [forkQuestion])
+        await log($, 'fork', e.description, [a])
+        if (usable(a, sh) && a.p !== undefined && a.p <= 1 - cfg.confidence) {
+          await bumpStats($, s => {
+            s.forkWarnings += 1
+          })
+          $.ui.toast(`Hmind: this fork copies the whole conversation, but its task looks self-contained (${pct(1 - a.p)}); a general-purpose agent would be far cheaper`)
+        }
+      } else if (e.model === undefined) {
+        const state = spawnState(e.subagentType, e.description, e.prompt)
+        const a = await decideOne($, cfg, state, [spawnQuestion])
+        await log($, 'spawn', e.description, [a])
+        if (usable(a, sh) && a.choice) {
+          const tight = opt.budgetMode && (sh.pressure.level === 'high' || sh.pressure.level === 'critical')
+          const target = a.choice.startsWith('a lookup') ? 'haiku' : a.choice.startsWith('mechanical') || tight ? 'sonnet' : undefined
+          if (target && rankOf(target) < rankOf(e.parentModel)) {
+            await bumpStats($, s => {
+              s.subagentsRouted += 1
+            })
+            $.ui.status(`Hmind: subagent "${e.description.slice(0, 40)}" routed to ${target} (${a.tier} ${pct(a.confidence)})`)
+            spawn = { ...e, model: target }
+            rerouted = true
+          }
+        }
       }
-      return next(e)
     }
-    if (e.model !== undefined) return next(e)
-    const state = spawnState(e.subagentType, e.description, e.prompt)
-    const a = await decideOne($, cfg, state, [spawnQuestion])
-    await log($, 'spawn', e.description, [a])
-    if (!usable(a, sh) || !a.choice) return next(e)
-    const tight = opt.budgetMode && (sh.pressure.level === 'high' || sh.pressure.level === 'critical')
-    const target = a.choice.startsWith('a lookup') ? 'haiku' : a.choice.startsWith('mechanical') || tight ? 'sonnet' : undefined
-    if (!target || rankOf(target) >= rankOf(e.parentModel)) return next(e)
-    await bumpStats($, s => {
-      s.subagentsRouted += 1
-    })
-    $.ui.status(`Hmind: subagent "${e.description.slice(0, 40)}" routed to ${target} (${a.tier} ${pct(a.confidence)})`)
-    const spawned = await next({ ...e, model: target })
-    const agentId = (spawned as { agentId?: string }).agentId
-    if (agentId) sh.routed.set(agentId, e.parentModel)
-    return spawned
+    const r = await next(spawn)
+    if (r.agentId !== undefined) {
+      sh.agents.set(r.agentId, { id: r.agentId, description: e.description, prompt: e.prompt, model: r.model, startedAt: await $.clock.now(), usage: { ...ZERO }, usd: 0, ours })
+      if (ours) sh.orchestrated.set(r.agentId, e.parentModel)
+      else if (rerouted) sh.routed.set(r.agentId, e.parentModel)
+    }
+    return r
   }).catch(($, e, next) => next(e))
+
+  // ------------------------------------------------------------ the model's own agents: long reports digested
+
+  on('tool.call', { tool: 'Agent' }, async ($, e, next) => {
+    const ran = await next(e)
+    if (!sh.enabled || opt.agentReportOver <= 0 || sh.ours.has(e.prompt) || ran.deny !== undefined || ran.isError) return ran
+    const res = ran.result as unknown as { status?: string; agentId?: string; content?: { type: 'text'; text: string }[] }
+    if (res.status !== 'completed' || !res.content || !res.agentId) return ran
+    const text = res.content.map(c => c.text).join('\n')
+    if (text.length <= opt.agentReportOver) return ran
+    const d = await digestReport($, cfg, e.description, text).catch(() => undefined)
+    if (!d || d.length >= text.length * 0.8) return ran
+    await $.store.set(`report:${res.agentId}`, text.slice(0, 60000))
+    await recordAvoided($, text.length - d.length)
+    await bumpStats($, s => {
+      s.reportsDigested += 1
+      s.trimmedChars += text.length - d.length
+    })
+    $.ui.status(`Hmind: digested a ${Math.round(text.length / 1000)}K-char agent report`)
+    const result = { ...res, content: [{ type: 'text' as const, text: `${d}\n\n[Hmind digested this report from ${text.length} characters; the full text: /hmind report ${res.agentId}]` }] } as unknown as typeof ran.result
+    return { result }
+  }).catch(($, e, next) => next(e))
+
+  // ------------------------------------------------------------ orchestrate: the model plans, Hmind runs
+
+  on('tool.call', { tool: /^mcp__hmind__orchestrate$/ }, async ($, e) => {
+    if (e.agentId !== undefined) return { result: 'error: orchestrate runs from the main conversation only; a subagent cannot start a plan.' }
+    const plan = parsePlan(e)
+    if (typeof plan === 'string') return { result: `error: ${plan}` }
+    if (sh.runs > 0) return { result: 'error: a plan is already running; wait for its result before starting another.' }
+    sh.runs += 1
+    try {
+      if (opt.budgetMode) sh.pressure = await readPressure($)
+      const ctx: RunCtx = {
+        cfg,
+        parentModel: sh.mainModel || 'opus',
+        maxParallel: opt.budgetMode ? parallelFor(sh.pressure.level, opt.maxParallel) : opt.maxParallel,
+        retry: plan.retry && opt.retryUp,
+        launch: makeLauncher($, sh.waiting, sh.ours, sh.mainModel || 'opus', opt.taskTimeoutMin * 60000),
+        classify: async t => {
+          const state = spawnState(t.subagentType ?? 'general-purpose', t.description, t.prompt)
+          const a = await decideOne($, cfg, state, [spawnQuestion])
+          await log($, 'spawn', t.description, [a])
+          if (!usable(a, sh) || !a.choice) return undefined
+          return a.choice.startsWith('a lookup') ? 'lookup' : a.choice.startsWith('mechanical') ? 'mechanical' : 'judgment'
+        },
+        judgeStatus: async (t, report) => {
+          const a = await decideOne($, cfg, outcomeState(t.prompt, report), [outcomeQuestion])
+          await log($, 'outcome', t.description, [a])
+          const status: Status = usable(a, sh) && a.choice ? (a.choice.startsWith('done') ? 'done' : a.choice.startsWith('partial') ? 'partial' : 'failed') : 'partial'
+          return status
+        },
+        progress: text => $.ui.status(text),
+      }
+      $.ui.toast(`Hmind: running ${plan.tasks.length} task${plan.tasks.length === 1 ? '' : 's'}, up to ${ctx.maxParallel} at once`)
+      const rec = await runPlan($, ctx, plan)
+      await rememberRun($, rec)
+      await bumpStats($, s => {
+        s.orchestrations += 1
+      })
+      $.ui.status(undefined)
+      $.ui.toast(`Hmind: run ${rec.id} finished, ${rec.tasks.filter(t => t.status === 'done').length}/${rec.tasks.length} done, ${money(rec.usd)}`)
+      return { result: runText(rec, ctx.parentModel) }
+    } finally {
+      sh.runs -= 1
+    }
+  })
 
   // ------------------------------------------------------------ end of turn
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     const usage = done.usage ?? e.usage
+    const waiter = e.agentId !== undefined ? sh.waiting.get(e.agentId) : undefined
+    if (waiter && e.agentId !== undefined) {
+      sh.waiting.delete(e.agentId)
+      waiter({ text: e.answer, usage, reason: e.reason })
+    }
     const calls = sh.steps.get(e.turnId) ?? 1
     sh.steps.delete(e.turnId)
     if (usage) {
-      const parent = e.agentId !== undefined ? sh.routed.get(e.agentId) : undefined
-      await recordModelCall($, e.agentId === undefined ? 'main' : parent ? 'routed' : 'subagent', usage.model, usage, calls, parent).catch(() => undefined)
+      const orch = e.agentId !== undefined ? sh.orchestrated.get(e.agentId) : undefined
+      const parent = e.agentId !== undefined ? (orch ?? sh.routed.get(e.agentId)) : undefined
+      await recordModelCall($, e.agentId === undefined ? 'main' : orch ? 'orchestrated' : parent ? 'routed' : 'subagent', usage.model, usage, calls, parent).catch(() => undefined)
+      const note = e.agentId !== undefined ? sh.agents.get(e.agentId) : undefined
+      if (note) {
+        note.usage = addUsage(note.usage, usage)
+        note.usd += usdOf(usage.model, usage)
+        note.model = usage.model
+        note.endedAt = await $.clock.now()
+      }
     }
     if (e.agentId !== undefined || !sh.enabled) return done
     const t = sh.turns.get(e.turnId)
@@ -649,6 +855,16 @@ export const register: Register = (on, options) => {
       return { text: ok ? `decision ${rest} marked ${verb}.` : `no decision ${rest} in the log.` }
     }
     if (verb === 'log') return { text: await logText($) }
+    if (verb === 'agents') return { text: agentsText(await $.agent.list().catch(() => []), sh.agents, await $.clock.now()) }
+    if (verb === 'runs') return { text: runsText(await loadRuns($)) }
+    if (verb === 'run' && rest) {
+      const rec = (await loadRuns($)).find(r => r.id === rest)
+      return { text: rec ? runDetail(rec) : `no run ${rest}; /hmind runs lists them.` }
+    }
+    if (verb === 'report' && rest) {
+      const full = (await $.store.get(`report:${rest}`)) as string | undefined
+      return { text: full ?? `no stored report for agent ${rest}; only reports Hmind digested are kept.` }
+    }
     if (verb === 'rules') {
       const mine = sh.rules.map((r, i) => ({ r, i })).filter(({ r }) => r.root === sh.root)
       if (mine.length === 0) return { text: 'no learned rules for this project. Add one with /hmind allow <command>.' }
