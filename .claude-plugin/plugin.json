@@ -1,7 +1,7 @@
 {
   "name": "hmind",
-  "version": "0.5.0",
-  "description": "A second brain and orchestrator for Claude Code: runs plans of subtasks as parallel subagents on the cheapest adequate model, governs the agents the model launches itself, guards risky commands, trims noisy output, right-sizes effort, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost.",
+  "version": "0.6.0",
+  "description": "A second brain and orchestrator for Claude Code: runs plans of subtasks as parallel subagents that share a board, notes and conventions, integrates and verifies the combined work, governs the agents the model launches itself, guards risky commands, trims noisy output, right-sizes effort, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost.",
   "license": "MIT",
   "userConfig": {
     "judgeModel": {

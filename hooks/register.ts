@@ -230,7 +230,8 @@ async function registerSurface($: EngineInterface, withOrchestrate: boolean): Pr
     description:
       'Run a plan of subtasks as parallel subagents. Give the goal and the tasks (id, prompt, optional description, needs = ids it depends on, kind = lookup | mechanical | judgment). ' +
       'Independent tasks run at once on the cheapest adequate model, each with the digested results of the tasks it needs; a task that fails is retried once on a stronger model; ' +
-      'the answer is one digest per task with status, model and cost. Use it when work splits into independent pieces instead of launching agents one by one.',
+      'the agents share a plan board and notes so they know each other\'s decisions and files; an integrator then checks the combined work for consistency and the project\'s verification runs. ' +
+      'The answer is one digest per task, the consistency verdict and the cost. Use it when work splits into independent pieces instead of launching agents one by one.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -252,8 +253,11 @@ async function registerSurface($: EngineInterface, withOrchestrate: boolean): Pr
             required: ['id', 'prompt'],
           },
         },
+        conventions: { type: 'string', description: 'Rules every task must follow for the work to be consistent: naming, file layout, libraries, interfaces, test style. Put shared names and signatures here.' },
         maxParallel: { type: 'number', description: 'At most this many tasks at once (default from settings, lowered under budget pressure).' },
         retry: { type: 'boolean', description: 'Retry a failed task once on a stronger model (default true).' },
+        integrate: { type: 'boolean', description: 'After the tasks, run an integrator on the parent model that reads every report and notes file, checks the combined work for consistency and fixes what is small (default true).' },
+        verify: { type: 'boolean', description: "Run the project's own test or build command on the combined work before and after integration (default true)." },
       },
       required: ['goal', 'tasks'],
     },
@@ -418,7 +422,7 @@ export const register: Register = (on, options) => {
             'served by a Claude judge model. Reach for it when you must classify, rank, route, gate or triage many items, or check a claim quickly, instead of reasoning about each at length.' +
             (opt.orchestrate
               ? ' An `orchestrate` tool (mcp__hmind__orchestrate) runs a plan you write as parallel subagents: give it the goal and the tasks with ids, prompts, `needs` (the ids a task depends on) and a kind (lookup, mechanical, judgment). ' +
-                'Hmind runs independent tasks at once on the cheapest adequate model, feeds each task the digested results of the ones it needs, retries a failed task once on a stronger model, and returns one digest per task with its cost. ' +
+                'Hmind runs independent tasks at once on the cheapest adequate model, keeps a shared board and notes so every agent knows the others\' decisions and files, feeds each task the digested results of the ones it needs, retries a failed task once on a stronger model, then runs an integrator and the project\'s verification over the combined work, and returns one digest per task with the consistency verdict and the cost. Put the rules the work must share in `conventions`. ' +
                 'Use it instead of launching agents one by one when work splits into three or more independent pieces; keep the judgment-heavy work for yourself.'
               : ''),
         },
@@ -664,6 +668,7 @@ export const register: Register = (on, options) => {
       if (opt.budgetMode) sh.pressure = await readPressure($)
       const ctx: RunCtx = {
         cfg,
+        root: sh.root || (await $.session.cwd()),
         parentModel: sh.mainModel || 'opus',
         maxParallel: opt.budgetMode ? parallelFor(sh.pressure.level, opt.maxParallel) : opt.maxParallel,
         retry: plan.retry && opt.retryUp,
@@ -680,6 +685,16 @@ export const register: Register = (on, options) => {
           await log($, 'outcome', t.description, [a])
           const status: Status = usable(a, sh) && a.choice ? (a.choice.startsWith('done') ? 'done' : a.choice.startsWith('partial') ? 'partial' : 'failed') : 'partial'
           return status
+        },
+        verify: async () => {
+          const command = await detectVerifyCommand($, sh.root)
+          if (!command) return undefined
+          const r = await runVerify($, command)
+          await bumpStats($, s => {
+            s.verifications += 1
+            if (!r.ok) s.verificationsFailed += 1
+          })
+          return { command, ok: r.ok && !r.denied, text: r.denied ? `the run was refused: ${r.denied}` : r.text }
         },
         progress: text => $.ui.status(text),
       }

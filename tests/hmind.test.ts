@@ -247,17 +247,20 @@ test('a plan runs independent tasks at once, feeds dependents, and retries a fai
     clock: { now: async () => (now += 10), sleep: async () => undefined },
     store: { get: async (k: string) => kept.get(k), set: async (k: string, v: unknown) => void kept.set(k, v) },
     model: { complete: async () => ({ isAnswered: false, reason: 'api-error', usage: NO_USAGE }) },
+    fs: { write: async (path: string, text: string) => void kept.set(`fs:${path}`, text), exists: async () => false, list: async () => [], read: async () => '' },
   } as any
   const calls: { id: string; model: string | undefined; prompt: string }[] = []
   let bTries = 0
   const usage = { input_tokens: 1000, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
   const ctx = {
     cfg: { judgeModel: 'haiku', confidence: 0.75, timeoutMs: 1000 },
+    root: '/home/dev/app',
     parentModel: 'claude-opus-5-5',
     maxParallel: 3,
     retry: true,
     classify: async () => undefined,
     judgeStatus: async () => 'partial' as const,
+    verify: async () => ({ command: 'npm test', ok: true, text: 'all green' }),
     progress: () => undefined,
     launch: async (task: { id: string }, model: string | undefined, prompt: string) => {
       calls.push({ id: task.id, model, prompt })
@@ -266,6 +269,7 @@ test('a plan runs independent tasks at once, feeds dependents, and retries a fai
         bTries += 1
         return { text: bTries === 1 ? 'could not find it\nSTATUS: failed\nFILES: none\nSUMMARY: stuck' : 'found it\nSTATUS: done\nFILES: none\nSUMMARY: b done on retry', usage, model: name, ms: 10 }
       }
+      if (task.id === 'integrate') return { text: 'CONSISTENCY: one helper name kept, nothing else\nSTATUS: done\nFILES: none\nSUMMARY: consistent', usage, model: name, ms: 10 }
       if (task.id === 'e') return { text: 'no way\nSTATUS: failed\nFILES: none\nSUMMARY: cannot', usage, model: name, ms: 10 }
       if (task.id === 'c') return { text: `saw: ${prompt.includes('SUMMARY: a done') ? 'a-digest' : 'nothing'}\nSTATUS: done\nFILES: src/c.ts\nSUMMARY: c done`, usage, model: name, ms: 10 }
       return { text: 'STATUS: done\nFILES: none\nSUMMARY: a done', usage, model: name, ms: 10 }
@@ -298,6 +302,16 @@ test('a plan runs independent tasks at once, feeds dependents, and retries a fai
   expect(eCalls[0]!.model).toBeUndefined()
   expect(text.includes('## e: failed')).toBe(true)
   expect(text.includes('## d: skipped')).toBe(true)
+  expect(c.prompt.includes('/home/dev/app/.hmind/runs/')).toBe(true)
+  expect(c.prompt.includes('board.md')).toBe(true)
+  expect(c.prompt.includes('notes/c.md')).toBe(true)
+  expect(c.prompt.includes('- b (')).toBe(true)
+  expect(text.includes('verification before integration: `npm test` PASSED')).toBe(true)
+  expect(text.includes('integrator: done on claude-opus-5-5')).toBe(true)
+  const board = [...kept.entries()].find(([k]) => k.endsWith('board.md'))?.[1] as string
+  expect(board.includes('## Contract')).toBe(true)
+  expect(board.includes('| c | done | sonnet | hmind-c | a |')).toBe(true)
+  expect(board.includes('Status: finished')).toBe(true)
   await rememberRun($, rec)
   expect(runsText(await loadRuns($)).includes('3/5 done')).toBe(true)
   expect(parsePlan({ goal: 'cycle', tasks: [{ id: 'x', prompt: 'x needs y first', needs: ['y'] }, { id: 'y', prompt: 'y needs x first', needs: ['x'] }] })).toBe('the tasks depend on each other in a cycle.')
