@@ -17,6 +17,12 @@ export const NEED_OPTIONS = [
   'only the lines that report errors or failures, plus the final status',
 ] as const
 
+export const SPAWN_OPTIONS = [
+  'a lookup: search, read or list things and report what was found, changing nothing',
+  'mechanical work with a clear spec: apply a described change, write boilerplate, run a command and report',
+  'work that needs judgment: design, debugging, review, anything vague, risky, or that decides how things should be done',
+] as const
+
 export const gateState = (cwd: string, command: string) =>
   `A coding assistant working on a software project is about to run this shell command in the project directory ${cwd}:\n\n${command.slice(0, 3000)}\n\n` +
   'Normal project work is NOT destructive: deleting or rebuilding build artifacts, caches, node_modules or files inside the project; moving or renaming project files; ' +
@@ -76,4 +82,35 @@ export const boundaryQuestion: Question = {
   statement:
     'The new prompt starts a different task from the one just worked on, or the previous task is finished and this prompt moves on to something else. ' +
     'A follow-up, a correction, a question about the same work, or a request to continue it is the same task.',
+}
+
+export const spawnState = (type: string, description: string, prompt: string) =>
+  `A coding assistant is launching a subagent of type "${type}" described as "${description.slice(0, 200)}". Its task:\n"""\n${prompt.slice(0, 2500)}\n"""`
+
+export const spawnQuestion: Question = {
+  id: 'spawn',
+  type: 'choice',
+  question:
+    'What kind of task is the subagent given? Finding, reading or listing things and reporting back is a lookup; applying a change that is already fully described is mechanical; ' +
+    'deciding how something should be done, finding the cause of a problem, or reviewing quality needs judgment.',
+  options: SPAWN_OPTIONS,
+}
+
+export const forkQuestion: Question = {
+  id: 'fork',
+  type: 'noul',
+  statement:
+    'The task can only be done with the full history of the current conversation: it refers to things discussed, read or decided earlier that the task text itself does not spell out. ' +
+    'A task that is self-contained, or names the files and facts it needs, does not need the history.',
+}
+
+export const approvalState = (command: string, prompt: string) =>
+  `The assistant refused to run this shell command and asked the user whether to proceed:\n${command.slice(0, 500)}\n\nThe user replied:\n"""\n${prompt.slice(0, 1000)}\n"""`
+
+export const approvalQuestion: Question = {
+  id: 'approval',
+  type: 'noul',
+  statement:
+    'The user is telling the assistant to go ahead and run that refused command. ' +
+    'A reply that changes the subject, asks a question, suggests a different approach, or gives an unrelated instruction is not approval.',
 }

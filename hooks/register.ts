@@ -1,31 +1,45 @@
-// Hmind: typed decisions inside Claude Code.
+// Hmind: a second brain for Claude Code.
 //
-// Five places a cheap, calibrated judgment pays for itself:
-//   1. tool.call Bash (before): refuse a command judged destructive.
-//   2. tool.call Bash (after): trim bulky output the assistant will not need.
-//   3. turn.step 0: lower the model's effort for trivial prompts and small changes.
-//   4. turn.complete: flag a "done" claim made without running any check.
-//   5. prompt.submit: compact the conversation at a task boundary once it is full.
-// Plus a `decide` tool the model can call itself, and `/hmind` for stats.
+// Where a cheap, calibrated judgment pays for itself:
+//   1. tool.call Bash (before): refuse a command judged destructive, unless a learned rule allows it.
+//   2. tool.call Bash (after): trim bulky output, or digest it when the failures are what matters.
+//   3. turn.step 0: right-size the model's effort to the prompt, tighter as the plan's budget fills.
+//   4. turn.complete: flag a "done" claim made without running any check; optionally verify it.
+//   5. prompt.submit: compact at a task boundary once context is full; learn allow rules from approvals.
+//   6. agent.spawn: route lookup and mechanical subagent work to cheaper models; warn on needless forks.
+// Plus a `decide` tool the model can call itself, `/hmind` for stats and control, and a trust in the
+// local judge that recalibrates itself from shadow checks against Claude.
 // Every hook fails open: when the judge is down or unsure, nothing changes.
 
 import type { Register, EngineInterface } from 'claude-code'
 
-import {
-  bumpStats,
-  calibration,
-  clamp,
-  decide,
-  decideOne,
-  defaultConfig,
-  emptyStats,
-  loadStats,
-  markOutcome,
-  recordAnswers,
-  remember,
-} from './judge'
+import { describeTrust, loadTrust, recordSample, resetTrust, SAMPLE_BAR } from './calibration'
+import type { TrustState } from './calibration'
+import { compactAtFor, describePressure, effortFor, readPressure, trimOverFor } from './budget'
+import type { Effort, Pressure, Size } from './budget'
+import { digest } from './digest'
+import { agrees, bumpStats, calibration, clamp, decide, decideClaude, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
 import type { Answer, DecisionRecord, JudgeConfig, Question } from './judge'
-import { boundaryQuestion, boundaryState, claimsQuestion, claimsState, gateQuestion, gateState, needQuestion, needState, sizeQuestion, sizeState } from './questions'
+import {
+  approvalQuestion,
+  approvalState,
+  boundaryQuestion,
+  boundaryState,
+  claimsQuestion,
+  claimsState,
+  forkQuestion,
+  gateQuestion,
+  gateState,
+  needQuestion,
+  needState,
+  sizeQuestion,
+  sizeState,
+  spawnQuestion,
+  spawnState,
+} from './questions'
+import { addRule, loadRules, matchRule, removeRule, templateOf } from './rules'
+import type { Rule } from './rules'
+import { detectVerifyCommand, runVerify } from './verify'
 
 const KEEP_RULES =
   'Keep, verbatim where short: the current goal and the latest user instructions; every file changed with a one-line note of what changed; ' +
@@ -49,9 +63,35 @@ type Options = {
   routeEffort: boolean
   doneCheck: string
   compactAt: number
-  /** per decision kind, the local confidence at which a local answer stands without escalation; 1 = always escalate */
-  trust: Record<string, number>
+  shadowRate: number
+  budgetMode: boolean
+  subagents: boolean
+  digest: boolean
+  autoVerify: boolean
+  learnRules: boolean
 }
+
+/** Everything the hooks share; a hot reload starts it over (trust, rules and stats live in $.store). */
+type Shared = {
+  cfg: JudgeConfig
+  opt: Options
+  enabled: boolean
+  localUp: boolean
+  wantsCompact: boolean
+  mainTurn: string | undefined
+  turns: Map<string, TurnState>
+  pendingTrims: PendingTrim[]
+  trust: TrustState
+  rules: Rule[]
+  pressure: Pressure
+  root: string
+  lastDeny?: { command: string; turn: number }
+  verifyPrompted: boolean
+}
+
+const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
+const normalize = (command: string) => command.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 160)
+const pct = (p: number) => `${Math.round(p * 100)}%`
 
 /** "gate=0.75,effort=1" -> { gate: 0.75, effort: 1 }; unknown kinds fall back to the global threshold. */
 function parseTrust(raw: unknown, fallback: number): Record<string, number> {
@@ -64,28 +104,13 @@ function parseTrust(raw: unknown, fallback: number): Record<string, number> {
   return out
 }
 
+const trustFor = (sh: Shared, kind: string): number => sh.trust.trust[kind] ?? sh.trust.trust.default ?? sh.cfg.confidence
+
 /** A local answer stands only above its kind's trust; a Claude answer above the global threshold. */
-function usable(a: Answer, kind: string, opt: Options, cfg: JudgeConfig): boolean {
+function usable(a: Answer, kind: string, sh: Shared): boolean {
   if (a.tier === 'none') return false
-  const bar = a.tier === 'local' ? (opt.trust[kind] ?? opt.trust.default ?? cfg.confidence) : cfg.confidence
-  return a.confidence >= bar
+  return a.confidence >= (a.tier === 'local' ? trustFor(sh, kind) : sh.cfg.confidence)
 }
-
-/** Everything the hooks share; a hot reload starts it over (stats live in $.store). */
-type Shared = {
-  cfg: JudgeConfig
-  opt: Options
-  enabled: boolean
-  localUp: boolean
-  wantsCompact: boolean
-  mainTurn: string | undefined
-  turns: Map<string, TurnState>
-  pendingTrims: PendingTrim[]
-}
-
-const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
-const normalize = (command: string) => command.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 160)
-const pct = (p: number) => `${Math.round(p * 100)}%`
 
 function headTail(out: string, head = 2500, tail = 2500): string {
   return `${out.slice(0, head)}\n…\n${out.slice(-tail)}`
@@ -98,13 +123,42 @@ function errorsOnly(out: string): string {
   return `${hits.join('\n')}\n…\n${ending.join('\n')}`
 }
 
-async function log($: EngineInterface, sh: Shared, kind: string, summary: string, answers: Answer[]): Promise<string> {
+const rankOf = (model: string): number => (/haiku/i.test(model) ? 0 : /sonnet/i.test(model) ? 1 : /opus/i.test(model) ? 2 : /fable|mythos/i.test(model) ? 3 : 2)
+
+// ------------------------------------------------------------ logging and calibration
+
+type ShadowSource = { state: string; question: Question }
+
+/** Record a batch of answers; feed the calibration with what the escalation already showed, and shadow-check a sample of the local answers that stood. */
+async function log($: EngineInterface, sh: Shared, kind: string, summary: string, answers: Answer[], source?: ShadowSource): Promise<string> {
   const id = newId()
   const rec: DecisionRecord = { id, at: new Date().toISOString(), kind, summary: summary.slice(0, 160), answers }
   await recordAnswers($, answers, sh.localUp)
   await remember($, rec)
+  for (const a of answers) {
+    if (a.tier === 'claude' && a.shadow?.tier === 'local' && a.shadow.confidence >= SAMPLE_BAR) {
+      await noteSample($, sh, kind, agrees(a.shadow, a))
+    } else if (a.tier === 'local' && source && sh.cfg.escalate && Math.random() < sh.opt.shadowRate) {
+      void shadowCheck($, sh, kind, source, a).catch(() => undefined)
+    }
+  }
   return id
 }
+
+async function noteSample($: EngineInterface, sh: Shared, kind: string, agreed: boolean): Promise<void> {
+  const changed = await recordSample($, sh.trust, kind, agreed)
+  if (changed) $.ui.toast(`Hmind: trust in the local judge for ${kind} ${changed.from} → ${changed.to}`)
+}
+
+async function shadowCheck($: EngineInterface, sh: Shared, kind: string, source: ShadowSource, local: Answer): Promise<void> {
+  const [c] = await decideClaude($, sh.cfg, source.state, [source.question])
+  if (!c || c.tier === 'none') return
+  const ok = agrees(local, c)
+  await noteSample($, sh, kind, ok)
+  if (!ok && kind === 'gate' && (c.p ?? 0) >= sh.opt.denyAt) $.ui.toast('Hmind: a shadow check disagreed with a shell gate; Claude would have refused it')
+}
+
+// ------------------------------------------------------------ local tier
 
 async function ping($: EngineInterface, cfg: JudgeConfig, ms: number): Promise<boolean> {
   const r = await Promise.race([$.http.fetch(`${cfg.ollamaUrl}/api/version`).catch(() => undefined), $.clock.sleep(ms).then(() => undefined)])
@@ -116,7 +170,6 @@ async function ensureLocal($: EngineInterface, sh: Shared): Promise<void> {
   const { cfg } = sh
   sh.localUp = await ping($, cfg, 1500)
   if (!sh.localUp) {
-    // Start a server for the session's life; a port already in use just ends the child.
     void (async () => {
       try {
         for await (const _chunk of $.process.spawn({ argv: ['ollama', 'serve'] })) {
@@ -149,11 +202,13 @@ async function ensureLocal($: EngineInterface, sh: Shared): Promise<void> {
   $.ui.status(`Hmind: ${cfg.ollamaModel} ready${cfg.escalate ? `, escalates to ${cfg.escalateModel}` : ''}`)
 }
 
+// ------------------------------------------------------------ surface
+
 async function registerSurface($: EngineInterface): Promise<void> {
   await $.command.register({
     name: 'hmind',
-    description: 'Hmind judge: stats, recent decisions, on/off, reset, label an outcome',
-    argumentHint: '[log|on|off|reset|right <id>|wrong <id>]',
+    description: 'Hmind: stats, decisions, trust, rules, verify, on/off',
+    argumentHint: '[log|trust|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
   })
   await $.tool.register({
     name: 'decide',
@@ -215,17 +270,17 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
   const c = await calibration($)
   const { cfg } = sh
   const avg = (ms: number, n: number) => (n ? `${Math.round(ms / n)} ms` : 'n/a')
+  const verifyOn = sh.opt.autoVerify || (await $.store.get(`verify:${sh.root}`)) === true
   return [
     `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions (local ${s.byTier.local}, claude ${s.byTier.claude}, unanswered ${s.byTier.none}), ${s.escalations} escalations`,
     `  latency: local avg ${avg(s.localMs, s.byTier.local)}, claude avg ${avg(s.claudeMs, s.byTier.claude)}`,
-    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.trimRegrets} regretted), ${s.denies} shell refusals, ${s.unverifiedClaims} unverified done claims, ${s.compactions} boundary compactions`,
-    `  calibration: ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, expected calibration error ${c.ece}`,
-    `  tiers: ${cfg.ollamaModel} at ${cfg.ollamaUrl} (${sh.localUp ? 'up' : 'down'}), escalation ${cfg.escalate ? cfg.escalateModel : 'off'}, confidence threshold ${cfg.confidence}`,
-    `  local trust: ${Object.entries(sh.opt.trust)
-      .filter(([k]) => k !== 'default')
-      .map(([k, v]) => `${k} ${v >= 1 ? 'never' : v}`)
-      .join(', ')}`,
-    '  /hmind log | on | off | reset | right <id> | wrong <id>',
+    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings`,
+    `  calibration: ${sh.trust.checks} shadow checks, ${sh.trust.checks ? pct(sh.trust.agreements / sh.trust.checks) : 'n/a'} agreement; ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
+    `  trust in the local judge: ${describeTrust(sh.trust)}`,
+    `  budget: ${sh.opt.budgetMode ? describePressure(sh.pressure) || `normal (${sh.pressure.percent}% of the ${sh.pressure.window} window)` : 'budget mode off'}`,
+    `  rules: ${sh.rules.filter(r => r.root === sh.root).length} learned for this project; auto-verify ${verifyOn ? 'on' : 'off'} here`,
+    `  tiers: ${cfg.ollamaModel} at ${cfg.ollamaUrl} (${sh.localUp ? 'up' : 'down'}), escalation ${cfg.escalate ? cfg.escalateModel : 'off'}, confidence threshold ${cfg.confidence}, shadow rate ${sh.opt.shadowRate}`,
+    '  /hmind log | trust [reset] | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
   ].join('\n')
 }
 
@@ -240,9 +295,43 @@ async function logText($: EngineInterface): Promise<string> {
   return `last ${recent.length} decisions (newest first); label one with /hmind right|wrong <id>\n${rows.join('\n')}`
 }
 
+// ------------------------------------------------------------ verification
+
+async function verifyNow($: EngineInterface, sh: Shared): Promise<void> {
+  const command = await detectVerifyCommand($, sh.root)
+  if (!command) {
+    $.ui.toast('Hmind: no test or build command recognised in this project, nothing run')
+    return
+  }
+  $.ui.toast(`Hmind: running \`${command}\` to verify the claim`)
+  const r = await runVerify($, command)
+  await bumpStats($, s => {
+    s.verifications += 1
+    if (!r.ok) s.verificationsFailed += 1
+  })
+  const body = r.denied ? `The run was refused: ${r.denied}` : r.text.length > 3500 ? errorsOnly(r.text).slice(0, 3500) : r.text
+  const verdict = r.denied ? 'not run' : r.ok ? 'PASSED' : 'FAILED'
+  await $.session
+    .append({
+      message: {
+        type: 'user',
+        content: [{ type: 'text', text: `Hmind ran \`${command}\` because the last message claimed completion without any verification this turn. Result: ${verdict}.\n\n${body}` }],
+      },
+    })
+    .catch(() => undefined)
+  $.ui.toast(`Hmind: verification ${verdict.toLowerCase()} (${command})`)
+  if (!r.ok && !r.denied && !sh.verifyPrompted) {
+    sh.verifyPrompted = true
+    void $.prompt.submit({ text: `Hmind: the verification run (\`${command}\`) failed; its output is in the note above. Fix the failures, or explain why they are unrelated.` })
+  }
+}
+
+// ------------------------------------------------------------ register
+
 export const register: Register = (on, options) => {
+  const cfg = defaultConfig(options)
   const sh: Shared = {
-    cfg: defaultConfig(options),
+    cfg,
     opt: {
       bashGuard: options.bashGuard !== false,
       denyAt: clamp(Number(options.denyAt ?? 0.85), 0.5, 0.99),
@@ -250,7 +339,12 @@ export const register: Register = (on, options) => {
       routeEffort: options.routeEffort !== false,
       doneCheck: String(options.doneCheck ?? 'toast'),
       compactAt: Math.max(0, Number(options.compactAt ?? 55)),
-      trust: parseTrust(options.localTrust ?? 'gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85', clamp(Number(options.confidence ?? 0.75), 0.5, 0.99)),
+      shadowRate: clamp(Number(options.shadowRate ?? 0.15), 0, 1),
+      budgetMode: options.budgetMode !== false,
+      subagents: options.subagents !== false,
+      digest: options.digest !== false,
+      autoVerify: options.autoVerify === true,
+      learnRules: options.learnRules !== false,
     },
     enabled: true,
     localUp: false,
@@ -258,15 +352,26 @@ export const register: Register = (on, options) => {
     mainTurn: undefined,
     turns: new Map(),
     pendingTrims: [],
+    trust: { trust: parseTrust(options.localTrust ?? 'gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1', cfg.confidence), samples: {}, adjustments: [], checks: 0, agreements: 0 },
+    rules: [],
+    pressure: { level: 'normal', percent: 0, window: 'none' },
+    root: '',
+    verifyPrompted: false,
   }
-  const { cfg, opt } = sh
+  const { opt } = sh
+  const defaults = { ...sh.trust.trust }
+  let lastLevel = 'normal'
 
   // ------------------------------------------------------------ session
 
   on('session.start', async ($, e, next) => {
     sh.enabled = (await loadStats($)).enabled
+    sh.root = await $.session.root().catch(() => e.cwd)
+    sh.trust = await loadTrust($, defaults)
+    sh.rules = await loadRules($)
     await registerSurface($)
     void ensureLocal($, sh).catch(() => undefined)
+    if (opt.budgetMode) void readPressure($).then(p => (sh.pressure = p)).catch(() => undefined)
     return next(e)
   })
 
@@ -299,21 +404,30 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     let effort = e.effort
     try {
-      if (sh.enabled && opt.routeEffort && e.agentId === undefined && e.index === 0 && typeof e.effort === 'string') {
-        const text = sh.turns.get(e.turnId)?.prompt ?? ''
-        if (text.length >= 8 && text.length <= 6000 && !text.startsWith('/')) {
-          const a = await decideOne($, cfg, sizeState(text), [sizeQuestion], { threshold: opt.trust.effort })
-          await log($, sh, 'effort', text, [a])
-          const rank: Record<string, number> = { low: 0, medium: 1, high: 2, xhigh: 3, max: 4 }
-          if (usable(a, 'effort', opt, cfg) && a.choice) {
-            if (a.choice.startsWith('a question')) effort = 'low'
-            else if (a.choice.startsWith('a small') && (rank[e.effort] ?? 0) > 1) effort = 'medium'
+      if (sh.enabled && e.agentId === undefined && e.index === 0) {
+        if (opt.budgetMode) {
+          sh.pressure = await readPressure($)
+          if (sh.pressure.level !== lastLevel) {
+            lastLevel = sh.pressure.level
+            if (sh.pressure.level !== 'normal') $.ui.toast(`Hmind: ${describePressure(sh.pressure)}; tightening effort, trimming and compaction`)
           }
-          if (effort !== e.effort) {
-            await bumpStats($, s => {
-              s.effortLowered += 1
-            })
-            $.ui.status(`Hmind: effort ${String(effort)} this turn (${a.tier} ${pct(a.confidence)})`)
+        }
+        if (opt.routeEffort && typeof e.effort === 'string') {
+          const text = sh.turns.get(e.turnId)?.prompt ?? ''
+          if (text.length >= 8 && text.length <= 6000 && !text.startsWith('/')) {
+            const state = sizeState(text)
+            const a = await decideOne($, cfg, state, [sizeQuestion], { threshold: trustFor(sh, 'effort') })
+            await log($, sh, 'effort', text, [a], { state, question: sizeQuestion })
+            if (usable(a, 'effort', sh) && a.choice) {
+              const size: Size = a.choice.startsWith('a question') ? 'trivial' : a.choice.startsWith('a small') ? 'small' : 'large'
+              effort = effortFor(opt.budgetMode ? sh.pressure.level : 'normal', size, e.effort as Effort)
+            }
+            if (effort !== e.effort) {
+              await bumpStats($, s => {
+                s.effortLowered += 1
+              })
+              $.ui.status(`Hmind: effort ${String(effort)} this turn (${a.tier} ${pct(a.confidence)}${sh.pressure.level !== 'normal' ? `, budget ${sh.pressure.level}` : ''})`)
+            }
           }
         }
       }
@@ -329,7 +443,7 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  // ------------------------------------------------------------ Bash: gate, then trim
+  // ------------------------------------------------------------ Bash: gate, then trim or digest
 
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const t = e.agentId === undefined && sh.mainTurn ? sh.turns.get(sh.mainTurn) : undefined
@@ -338,7 +452,6 @@ export const register: Register = (on, options) => {
       if (VERIFY.test(e.command)) t.verifications += 1
     }
 
-    // A trimmed output whose command is re-run right away was a trim the model regretted.
     const norm = normalize(e.command)
     for (const p of sh.pendingTrims) {
       p.callsLeft -= 1
@@ -353,40 +466,63 @@ export const register: Register = (on, options) => {
     sh.pendingTrims = sh.pendingTrims.filter(p => p.callsLeft > 0)
 
     if (sh.enabled && opt.bashGuard && RISKY.test(e.command) && !SAFE_BASH.test(e.command)) {
-      const cwd = await $.session.cwd()
-      const a = await decideOne($, cfg, gateState(cwd, e.command), [gateQuestion], { threshold: opt.trust.gate })
-      await log($, sh, 'gate', e.command, [a])
-      if (usable(a, 'gate', opt, cfg) && a.p !== undefined && a.p >= opt.denyAt) {
+      const rule = matchRule(sh.rules, sh.root, e.command)
+      if (rule) {
         await bumpStats($, s => {
-          s.denies += 1
+          s.rulesApplied += 1
         })
-        $.ui.toast(`Hmind: refused a shell command judged destructive (${pct(a.p)})`)
-        return {
-          deny:
-            `Hmind refused this command: it looks destructive (p=${a.p}, ${a.tier}${a.why ? `: ${a.why}` : ''}). ` +
-            'Do not retry it as is. If it is truly needed, explain the risk to the user and ask them to run it or approve it explicitly.',
+        $.ui.status(`Hmind: allowed by a learned rule (${rule.via})`)
+      } else {
+        const cwd = await $.session.cwd()
+        const state = gateState(cwd, e.command)
+        const a = await decideOne($, cfg, state, [gateQuestion], { threshold: trustFor(sh, 'gate') })
+        await log($, sh, 'gate', e.command, [a], { state, question: gateQuestion })
+        if (usable(a, 'gate', sh) && a.p !== undefined && a.p >= opt.denyAt) {
+          await bumpStats($, s => {
+            s.denies += 1
+          })
+          sh.lastDeny = { command: e.command, turn: await $.session.turns().catch(() => 0) }
+          $.ui.toast(`Hmind: refused a shell command judged destructive (${pct(a.p)})`)
+          return {
+            deny:
+              `Hmind refused this command: it looks destructive (p=${a.p}, ${a.tier}${a.why ? `: ${a.why}` : ''}). ` +
+              'Do not retry it as is. If it is truly needed, explain the risk to the user and ask them to run it or approve it explicitly.',
+          }
         }
       }
     }
 
     const ran = await next(e)
 
+    const trimOver = opt.budgetMode ? trimOverFor(sh.pressure.level, opt.trimOver) : opt.trimOver
     if (
       sh.enabled &&
-      opt.trimOver > 0 &&
+      trimOver > 0 &&
       ran.deny === undefined &&
       ran.isError === undefined &&
       ran.result &&
       typeof ran.result.stdout === 'string' &&
-      ran.result.stdout.length > opt.trimOver &&
+      ran.result.stdout.length > trimOver &&
       !ran.result.isImage &&
       !ran.result.backgroundTaskId
     ) {
       const out = ran.result.stdout
-      const a = await decideOne($, cfg, needState(e.command, out), [needQuestion], { threshold: opt.trust.trim })
-      const id = await log($, sh, 'trim', e.command, [a])
-      if (usable(a, 'trim', opt, cfg) && a.choice && !a.choice.startsWith('all')) {
-        const kept = a.choice.startsWith('only') ? errorsOnly(out) : headTail(out)
+      const state = needState(e.command, out)
+      const a = await decideOne($, cfg, state, [needQuestion], { threshold: trustFor(sh, 'trim') })
+      const id = await log($, sh, 'trim', e.command, [a], { state, question: needQuestion })
+      if (usable(a, 'trim', sh) && a.choice && !a.choice.startsWith('all')) {
+        let kept: string | undefined
+        let how = a.choice.split(':')[0] ?? 'trimmed'
+        if (a.choice.startsWith('only') && opt.digest && out.length > 8000) {
+          kept = await digest($, cfg, e.command, out).catch(() => undefined)
+          if (kept) {
+            how = 'digest of the failures and final status'
+            await bumpStats($, s => {
+              s.digests += 1
+            })
+          }
+        }
+        kept ??= a.choice.startsWith('only') ? errorsOnly(out) : headTail(out)
         if (kept.length < out.length * 0.8) {
           const saved = out.length - kept.length
           sh.pendingTrims.push({ norm, id, callsLeft: 3 })
@@ -394,13 +530,44 @@ export const register: Register = (on, options) => {
             s.trims += 1
             s.trimmedChars += saved
           })
-          $.ui.status(`Hmind: trimmed ${Math.round(saved / 1000)}K chars of output (${a.tier} ${pct(a.confidence)})`)
-          const note = `\n\n[Hmind trimmed ${saved} of ${out.length} characters from the middle of this output (${a.choice.split(':')[0]}). Rerun with grep, head or tail if you need a specific part.]`
+          $.ui.status(`Hmind: ${how.startsWith('digest') ? 'digested' : 'trimmed'} ${Math.round(saved / 1000)}K chars of output (${a.tier} ${pct(a.confidence)})`)
+          const note = `\n\n[Hmind replaced ${saved} of ${out.length} characters of this output with ${how}. Rerun with grep, head or tail if you need a specific part.]`
           return { result: { ...ran.result, stdout: kept + note } }
         }
       }
     }
     return ran
+  }).catch(($, e, next) => next(e))
+
+  // ------------------------------------------------------------ subagents
+
+  on('agent.spawn', async ($, e, next) => {
+    if (!sh.enabled || !opt.subagents || e.parentAgentId !== undefined) return next(e)
+    if (e.subagentType === 'fork') {
+      const state = spawnState(e.subagentType, e.description, e.prompt)
+      const a = await decideOne($, cfg, state, [forkQuestion], { threshold: trustFor(sh, 'fork') })
+      await log($, sh, 'fork', e.description, [a], { state, question: forkQuestion })
+      if (usable(a, 'fork', sh) && a.p !== undefined && a.p <= 1 - cfg.confidence) {
+        await bumpStats($, s => {
+          s.forkWarnings += 1
+        })
+        $.ui.toast(`Hmind: this fork copies the whole conversation, but its task looks self-contained (${pct(1 - a.p)}); a general-purpose agent would be far cheaper`)
+      }
+      return next(e)
+    }
+    if (e.model !== undefined) return next(e)
+    const state = spawnState(e.subagentType, e.description, e.prompt)
+    const a = await decideOne($, cfg, state, [spawnQuestion], { threshold: trustFor(sh, 'spawn') })
+    await log($, sh, 'spawn', e.description, [a], { state, question: spawnQuestion })
+    if (!usable(a, 'spawn', sh) || !a.choice) return next(e)
+    const tight = opt.budgetMode && (sh.pressure.level === 'high' || sh.pressure.level === 'critical')
+    const target = a.choice.startsWith('a lookup') ? 'haiku' : a.choice.startsWith('mechanical') || tight ? 'sonnet' : undefined
+    if (!target || rankOf(target) >= rankOf(e.parentModel)) return next(e)
+    await bumpStats($, s => {
+      s.subagentsRouted += 1
+    })
+    $.ui.status(`Hmind: subagent "${e.description.slice(0, 40)}" routed to ${target} (${a.tier} ${pct(a.confidence)})`)
+    return next({ ...e, model: target })
   }).catch(($, e, next) => next(e))
 
   // ------------------------------------------------------------ end of turn
@@ -414,21 +581,25 @@ export const register: Register = (on, options) => {
     if (opt.compactAt > 0) {
       const usage = await $.session.usage().catch(() => undefined)
       const percent = usage?.context.percent ?? 0
-      if (percent >= opt.compactAt) {
+      const bar = opt.budgetMode ? compactAtFor(sh.pressure.level, opt.compactAt) : opt.compactAt
+      if (percent >= bar) {
         sh.wantsCompact = true
         $.ui.status(`Hmind: context ${percent}% full, will compact at the next task boundary`)
       }
     }
 
     if (opt.doneCheck !== 'off' && e.reason === 'answer' && t && t.edits > 0 && t.verifications === 0 && done.text.length > 40) {
-      const a = await decideOne($, cfg, claimsState(t.edits, done.text), [claimsQuestion], { threshold: opt.trust.done })
-      await log($, sh, 'done-check', done.text, [a])
-      if (usable(a, 'done', opt, cfg) && a.p !== undefined && a.p >= cfg.confidence) {
+      const state = claimsState(t.edits, done.text)
+      const a = await decideOne($, cfg, state, [claimsQuestion], { threshold: trustFor(sh, 'done') })
+      await log($, sh, 'done-check', done.text, [a], { state, question: claimsQuestion })
+      if (usable(a, 'done', sh) && a.p !== undefined && a.p >= cfg.confidence) {
         await bumpStats($, s => {
           s.unverifiedClaims += 1
         })
         $.ui.toast(`Hmind: completion claimed, but nothing was run to verify it this turn (${pct(a.p)})`)
-        if (opt.doneCheck === 'prompt') {
+        const verifyOn = opt.autoVerify || (await $.store.get(`verify:${sh.root}`)) === true
+        if (verifyOn) await verifyNow($, sh).catch(() => undefined)
+        else if (opt.doneCheck === 'prompt') {
           void $.prompt.submit({
             text: 'Hmind: you reported the work as done, but no test, build or run command was executed this turn. Verify it now with the relevant command, or state plainly that it is unverified.',
           })
@@ -438,15 +609,36 @@ export const register: Register = (on, options) => {
     return done
   })
 
-  // ------------------------------------------------------------ next prompt: compact at a boundary
+  // ------------------------------------------------------------ next prompt: approvals, boundary compaction
 
   on('prompt.submit', async ($, e, next) => {
+    const typed = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
+    if (typed && e.command === undefined && !e.isMeta) sh.verifyPrompted = false
+
+    if (sh.enabled && opt.learnRules && sh.lastDeny && typed && e.command === undefined && !e.isMeta && e.text.length >= 2) {
+      const turn = await $.session.turns().catch(() => 0)
+      if (turn - sh.lastDeny.turn <= 2) {
+        const state = approvalState(sh.lastDeny.command, e.text)
+        const a = await decideOne($, cfg, state, [approvalQuestion], { threshold: trustFor(sh, 'approval') })
+        await log($, sh, 'approval', e.text, [a], { state, question: approvalQuestion })
+        if (usable(a, 'approval', sh) && a.p !== undefined && a.p >= 0.8) {
+          sh.rules = await addRule($, sh.rules, { template: templateOf(sh.lastDeny.command), root: sh.root, at: new Date().toISOString(), via: 'approval', example: sh.lastDeny.command.slice(0, 200) })
+          await bumpStats($, s => {
+            s.rulesLearned += 1
+          })
+          $.ui.toast(`Hmind: learned to allow \`${sh.lastDeny.command.slice(0, 50)}\` in this project (/hmind rules)`)
+          sh.lastDeny = undefined
+        }
+      } else sh.lastDeny = undefined
+    }
+
     if (sh.enabled && sh.wantsCompact && opt.compactAt > 0 && e.command === undefined && !e.isMeta && e.turnId === undefined && e.text.length >= 4) {
       const msgs = await $.session.messages()
       const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant')?.text ?? ''
-      const a = await decideOne($, cfg, boundaryState(lastAssistant, e.text), [boundaryQuestion], { threshold: opt.trust.boundary })
-      await log($, sh, 'boundary', e.text, [a])
-      if (usable(a, 'boundary', opt, cfg) && a.p !== undefined && a.p >= cfg.confidence) {
+      const state = boundaryState(lastAssistant, e.text)
+      const a = await decideOne($, cfg, state, [boundaryQuestion], { threshold: trustFor(sh, 'boundary') })
+      await log($, sh, 'boundary', e.text, [a], { state, question: boundaryQuestion })
+      if (usable(a, 'boundary', sh) && a.p !== undefined && a.p >= cfg.confidence) {
         const r = await $.session.compact({ instructions: KEEP_RULES })
         if (!('skip' in r)) {
           sh.wantsCompact = false
@@ -469,12 +661,11 @@ export const register: Register = (on, options) => {
   // ------------------------------------------------------------ the model's own tool
 
   on('tool.call', { tool: 'mcp__hmind__decide' }, async ($, e) => {
-    // A registered tool answers with a string (or content blocks); the model reads it as the tool's result.
     const input = e as unknown as { state?: unknown; questions?: unknown }
     if (typeof input.state !== 'string') return { result: 'error: decide needs a string `state`.' }
     const questions = parseQuestions(input.questions)
     if (typeof questions === 'string') return { result: `error: ${questions}` }
-    const answers = await decide($, cfg, input.state, questions, { threshold: opt.trust.tool })
+    const answers = await decide($, cfg, input.state, questions, { threshold: trustFor(sh, 'tool') })
     await log($, sh, 'tool', `${questions.length} question(s)`, answers)
     return { result: formatAnswers(answers) }
   })
@@ -483,7 +674,8 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'hmind' }, async ($, e) => {
     const args = String((e as { args?: unknown }).args ?? '').trim()
-    const [verb, arg] = args.split(/\s+/)
+    const [verb, ...restWords] = args.split(/\s+/)
+    const rest = restWords.join(' ')
     if (verb === 'on' || verb === 'off') {
       sh.enabled = verb === 'on'
       await bumpStats($, s => {
@@ -496,11 +688,49 @@ export const register: Register = (on, options) => {
       await $.store.set('recent', [])
       return { text: 'Hmind stats cleared.' }
     }
-    if ((verb === 'right' || verb === 'wrong') && arg) {
-      const ok = await markOutcome($, arg, verb)
-      return { text: ok ? `decision ${arg} marked ${verb}.` : `no decision ${arg} in the log.` }
+    if ((verb === 'right' || verb === 'wrong') && rest) {
+      const ok = await markOutcome($, rest, verb)
+      const recent = ((await $.store.get('recent')) as DecisionRecord[] | undefined) ?? []
+      const rec = recent.find(r => r.id === rest)
+      if (ok && rec?.answers[0]?.tier === 'local') await noteSample($, sh, rec.kind, verb === 'right')
+      return { text: ok ? `decision ${rest} marked ${verb}.` : `no decision ${rest} in the log.` }
     }
     if (verb === 'log') return { text: await logText($) }
+    if (verb === 'trust') {
+      if (rest === 'reset') {
+        await resetTrust($)
+        sh.trust = await loadTrust($, defaults)
+        return { text: `trust reset to the configured defaults: ${describeTrust(sh.trust)}` }
+      }
+      return { text: `trust in the local judge: ${describeTrust(sh.trust)}\n${sh.trust.checks} shadow checks, ${sh.trust.checks ? pct(sh.trust.agreements / sh.trust.checks) : 'n/a'} agreement; a kind moves 0.05 every 10 samples (down at 90%+ agreement, up under 80%).` }
+    }
+    if (verb === 'rules') {
+      const mine = sh.rules.map((r, i) => ({ r, i })).filter(({ r }) => r.root === sh.root)
+      if (mine.length === 0) return { text: 'no learned rules for this project. Add one with /hmind allow <command>.' }
+      return { text: `allow rules for ${sh.root}:\n${mine.map(({ r, i }) => `  ${i}  ${r.via.padEnd(8)} ${r.example}`).join('\n')}\nRemove one with /hmind forget <n>.` }
+    }
+    if (verb === 'allow' && rest) {
+      sh.rules = await addRule($, sh.rules, { template: templateOf(rest), root: sh.root, at: new Date().toISOString(), via: 'manual', example: rest.slice(0, 200) })
+      return { text: `commands shaped like \`${rest}\` are allowed in this project without judging.` }
+    }
+    if (verb === 'forget' && rest) {
+      const i = Number(rest)
+      if (!Number.isInteger(i) || !sh.rules[i]) return { text: `no rule ${rest}.` }
+      sh.rules = await removeRule($, sh.rules, i)
+      return { text: `rule ${i} removed.` }
+    }
+    if (verb === 'verify') {
+      if (rest === 'on' || rest === 'off') {
+        await $.store.set(`verify:${sh.root}`, rest === 'on')
+        return { text: `auto-verify ${rest} for this project${rest === 'on' ? `; command: ${(await detectVerifyCommand($, sh.root)) ?? 'none recognised yet'}` : ''}.` }
+      }
+      const cmd = await detectVerifyCommand($, sh.root)
+      return { text: `auto-verify is ${opt.autoVerify || (await $.store.get(`verify:${sh.root}`)) === true ? 'on' : 'off'} here; recognised command: ${cmd ?? 'none'}. Toggle with /hmind verify on|off.` }
+    }
+    if (verb === 'budget') {
+      sh.pressure = await readPressure($)
+      return { text: `${describePressure(sh.pressure) || `budget normal: ${sh.pressure.percent}% of the ${sh.pressure.window} window used`}; mode ${opt.budgetMode ? 'on' : 'off'}.` }
+    }
     return { text: await statsText($, sh) }
   })
 }

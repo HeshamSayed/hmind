@@ -1,6 +1,6 @@
 {
   "name": "hmind",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A second brain for Claude Code: guards risky commands, trims noisy output, right-sizes effort per prompt, catches unverified done claims and compacts at task boundaries. Fast local judgments, Claude when it matters, every decision logged.",
   "license": "MIT",
   "userConfig": {
@@ -31,8 +31,26 @@
     "confidence": {
       "type": "number",
       "title": "Confidence threshold",
-      "description": "Below this local confidence (0-1) a decision escalates; below it after escalation the mod does nothing",
+      "description": "Below this confidence (0-1) a Claude answer is not acted on",
       "default": 0.75
+    },
+    "localTrust": {
+      "type": "string",
+      "title": "Local trust per kind (starting values)",
+      "description": "kind=threshold pairs: the local confidence at which a local answer stands without asking Claude (1 = always ask). Self-calibration moves these; /hmind trust shows the live values",
+      "default": "gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1"
+    },
+    "shadowRate": {
+      "type": "number",
+      "title": "Shadow check rate",
+      "description": "Share (0-1) of local answers that stood which are also checked against Claude to recalibrate trust",
+      "default": 0.15
+    },
+    "budgetMode": {
+      "type": "boolean",
+      "title": "Budget pressure mode",
+      "description": "Tighten effort, trimming and compaction as the plan's 5-hour and 7-day usage windows fill",
+      "default": true
     },
     "bashGuard": {
       "type": "boolean",
@@ -46,11 +64,23 @@
       "description": "Probability (0-1) of destruction at which a shell command is refused",
       "default": 0.85
     },
+    "learnRules": {
+      "type": "boolean",
+      "title": "Learn allow rules",
+      "description": "When you approve a refused command, remember its shape for this project and stop refusing it",
+      "default": true
+    },
     "trimOver": {
       "type": "number",
       "title": "Trim output over",
-      "description": "Bash output longer than this many characters is judged for trimming (0 disables)",
+      "description": "Bash output longer than this many characters is judged for trimming (0 disables; shrinks under budget pressure)",
       "default": 6000
+    },
+    "digest": {
+      "type": "boolean",
+      "title": "Digest failures",
+      "description": "When only the failures matter, have Claude write a compact digest instead of a head-and-tail cut",
+      "default": true
     },
     "routeEffort": {
       "type": "boolean",
@@ -58,27 +88,29 @@
       "description": "Lower the model's effort for trivial prompts and small changes",
       "default": true
     },
+    "subagents": {
+      "type": "boolean",
+      "title": "Subagent governance",
+      "description": "Route lookup and mechanical subagent work to cheaper models; warn when a fork is launched for a self-contained task",
+      "default": true
+    },
     "doneCheck": {
       "type": "string",
       "title": "Done check",
       "description": "What to do when a turn claims completion without running any test, build or check",
-      "options": [
-        "off",
-        "toast",
-        "prompt"
-      ],
+      "options": ["off", "toast", "prompt"],
       "default": "toast"
     },
-    "localTrust": {
-      "type": "string",
-      "title": "Local trust per kind",
-      "description": "kind=threshold pairs: the local confidence at which a local answer stands without asking Claude (1 = always ask Claude). Kinds: gate, trim, effort, done, boundary, tool",
-      "default": "gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85"
+    "autoVerify": {
+      "type": "boolean",
+      "title": "Auto-verify everywhere",
+      "description": "Run the project's test or build command when a turn claims completion without verification (or enable per project with /hmind verify on)",
+      "default": false
     },
     "compactAt": {
       "type": "number",
       "title": "Compact at %",
-      "description": "Context fill percentage after which the next task boundary triggers a compaction (0 disables)",
+      "description": "Context fill percentage after which the next task boundary triggers a compaction (0 disables; lowers under budget pressure)",
       "default": 55
     }
   }

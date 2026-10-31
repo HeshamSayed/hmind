@@ -35,6 +35,8 @@ export type Answer = {
   tier: 'local' | 'claude' | 'none'
   ms: number
   why?: string
+  /** on a Claude answer: the local attempt it replaced, kept for calibration */
+  shadow?: Answer
 }
 
 export type JudgeConfig = {
@@ -257,10 +259,23 @@ export async function decide($: EngineInterface, cfg: JudgeConfig, state: string
     const better = await claudeAnswers($, cfg, clipped, unsure).catch(() => new Map<string, Answer>())
     questions.forEach((q, i) => {
       const b = better.get(q.id)
-      if (b) answers[i] = b
+      if (b) answers[i] = { ...b, shadow: answers[i] }
     })
   }
   return questions.map((q, i) => answers[i] ?? { id: q.id, type: q.type, confidence: 0, tier: 'none', ms: 0 })
+}
+
+/** Claude's answers alone, for a shadow check of a local answer that stood. */
+export async function decideClaude($: EngineInterface, cfg: JudgeConfig, state: string, questions: Question[]): Promise<Answer[]> {
+  const m = await claudeAnswers($, cfg, state, questions).catch(() => new Map<string, Answer>())
+  return questions.map(q => m.get(q.id) ?? { id: q.id, type: q.type, confidence: 0, tier: 'none', ms: 0 })
+}
+
+/** Whether two answers to the same question agree (scores within a quarter). */
+export function agrees(a: Answer, b: Answer): boolean {
+  if (a.tier === 'none' || b.tier === 'none') return false
+  if (a.type === 'score') return Math.abs((a.score ?? 0) - (b.score ?? 0)) <= 0.25
+  return a.choice === b.choice
 }
 
 /** `decide` for a single question: always one Answer back. */
@@ -289,6 +304,13 @@ export type Stats = {
   unverifiedClaims: number
   compactions: number
   enabled: boolean
+  digests: number
+  subagentsRouted: number
+  forkWarnings: number
+  verifications: number
+  verificationsFailed: number
+  rulesApplied: number
+  rulesLearned: number
 }
 
 export const emptyStats = (): Stats => ({
@@ -305,6 +327,13 @@ export const emptyStats = (): Stats => ({
   unverifiedClaims: 0,
   compactions: 0,
   enabled: true,
+  digests: 0,
+  subagentsRouted: 0,
+  forkWarnings: 0,
+  verifications: 0,
+  verificationsFailed: 0,
+  rulesApplied: 0,
+  rulesLearned: 0,
 })
 
 export async function loadStats($: EngineInterface): Promise<Stats> {
