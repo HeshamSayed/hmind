@@ -33,7 +33,6 @@ The result is leaner sessions, fewer wasted tokens, safer hands on the shell, wo
 - [Commands](#commands)
 - [Settings](#settings)
 - [Platforms](#platforms)
-- [Demo](#demo)
 - [Development](#development)
 - [FAQ](#faq)
 - [License](#license)
@@ -236,14 +235,6 @@ Settings live in Claude Code's config menu under the plugin's name.
 
 Hmind runs wherever Claude Code runs: macOS, Linux and Windows. On Windows the shell guard understands PowerShell and `cmd` forms as well as the Git Bash ones: `Remove-Item -Recurse -Force`, `rd /s /q`, `del`, `format`, `diskpart`, `Stop-Process`, `reg delete`, `Set-ExecutionPolicy`, `irm ... | iex` and friends are judged like `rm -rf` and `curl | sh`. Auto-verify spells its commands for the platform (`python` and `gradlew.bat` on Windows, `python3` and `./gradlew` elsewhere) and recognises npm, pnpm, yarn, bun, pytest, Cargo, Go, Flutter, Mix, Gradle, Maven, .NET, Make, RSpec and PHPUnit projects.
 
-## Demo
-
-`demo/hmind.tape` records a real session with [VHS](https://github.com/charmbracelet/vhs): the shell guard refuses `rm -rf .git` and says why, `/hmind usage` shows the ledger, and a two-task orchestration finishes in 17 seconds for $0.06. Produce `demo/hmind.gif` and `demo/hmind.mp4` with:
-
-```sh
-vhs demo/hmind.tape
-```
-
 ## Development
 
 ```
@@ -253,7 +244,6 @@ hooks/            register.ts (the hooks), judge.ts (typed questions), questions
                   verify.ts, rules.ts, platform.ts
 eval/             labeled cases and the harness that measures the judge
 tests/            the plugin's test suite, run by Claude Code's own test kit
-demo/             the VHS tape
 ```
 
 ```sh
