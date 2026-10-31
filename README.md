@@ -280,4 +280,4 @@ Type-check with `tsc -p .` once the plugin has loaded in a session; Claude Code 
 
 ## License
 
-MIT. Made by [Hesham Sayed](https://github.com/HeshamSayed) (hesham.sayed@zedny.com).
+MIT. Made by [Hesham Sayed](https://github.com/HeshamSayed) (hesham.sayed636@gmail.com).
