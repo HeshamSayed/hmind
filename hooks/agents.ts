@@ -24,13 +24,13 @@ export function overlap(a: string, b: string): number {
 
 export const isActive = (a: AgentInfo): boolean => a.status === 'running' || a.status === 'pending' || a.status === 'waiting'
 
-/** Wait until fewer than `cap` agents are active, polling every two seconds; returns how long it waited. */
-export async function waitForSlot($: EngineInterface, cap: number, maxWaitMs: number): Promise<number> {
+/** Wait until fewer than `cap` agents are active, polling every two seconds, at most `maxWaitMs` (a hook's own time is bounded); returns how long it waited and what is still active. */
+export async function waitForSlot($: EngineInterface, cap: number, maxWaitMs: number): Promise<{ waited: number; active: AgentInfo[] }> {
   const started = await $.clock.now()
   for (;;) {
-    const active = (await $.agent.list().catch(() => [] as AgentInfo[])).filter(isActive).length
+    const active = (await $.agent.list().catch(() => [] as AgentInfo[])).filter(isActive)
     const waited = (await $.clock.now()) - started
-    if (active < cap || waited >= maxWaitMs) return waited
+    if (active.length < cap || waited >= maxWaitMs) return { waited, active }
     await $.clock.sleep(2000)
   }
 }

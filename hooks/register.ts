@@ -22,8 +22,8 @@ import { compactAtFor, describePressure, effortFor, readPressure, trimOverFor } 
 import type { Effort, Pressure, Size } from './budget'
 import { digest, digestReport } from './digest'
 import { clearLedgers, ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest, resetAvoided, setLedgerSession, summarize, updateLedger } from './ledger'
-import { ZERO, addUsage, loadRuns, makeLauncher, parallelFor, parsePlan, rememberRun, runDetail, runPlan, runText, runsText } from './orchestrate'
-import type { RunCtx, Status, Waiter } from './orchestrate'
+import { ZERO, addUsage, agentNameFor, boardDirFor, duration, loadRuns, makeLauncher, newRunId, parallelFor, parsePlan, rememberRun, runDetail, runPlan, runText, runsText } from './orchestrate'
+import type { Plan, Progress, RunCtx, Status, Waiter } from './orchestrate'
 import { money, usdOf } from './pricing'
 import { bumpStats, calibration, clamp, decide, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
 import type { Answer, DecisionRecord, JudgeConfig, Question } from './judge'
@@ -120,6 +120,10 @@ type Shared = {
   runs: number
   /** orchestrated agents whose report the launcher is waiting for */
   waiting: Map<string, Waiter>
+  /** the run in flight, for /hmind runs */
+  live?: Progress & { goal: string; startedAt: number }
+  /** agent names of the current and last run, whose hand-back messages Hmind absorbs */
+  recentAgents: Set<string>
 }
 
 const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
@@ -160,7 +164,17 @@ async function govern($: EngineInterface, sh: Shared, e: { description: string; 
   const { opt, cfg } = sh
   if (opt.agentCap > 0) {
     const cap = opt.budgetMode ? parallelFor(sh.pressure.level, opt.agentCap) : opt.agentCap
-    const waited = await waitForSlot($, cap, 5 * 60000)
+    const { waited, active } = await waitForSlot($, cap, 7000)
+    if (active.length >= cap) {
+      await bumpStats($, s => {
+        s.agentsHeld += 1
+      })
+      $.ui.toast(`Hmind: refused a new agent, ${active.length} already running (cap ${cap})`)
+      return (
+        `Hmind refused this agent for now: ${active.length} agents are already running (cap ${cap}${sh.pressure.level !== 'normal' ? `, lowered by budget pressure` : ''}): ` +
+        `${active.map(a => `${a.description} (${a.id})`).join('; ')}. Wait for one to finish, then launch it again.`
+      )
+    }
     if (waited > 2500) {
       await bumpStats($, s => {
         s.agentsHeld += 1
@@ -186,13 +200,39 @@ async function govern($: EngineInterface, sh: Shared, e: { description: string; 
   )
 }
 
+// ------------------------------------------------------------ orchestration in the background
+
+/** Run a plan after the tool call has answered: a hook's own time is bounded, a detached run is not. The result reaches the model as a message. */
+async function startRun($: EngineInterface, sh: Shared, ctx: RunCtx, plan: Plan, id: string): Promise<void> {
+  try {
+    const rec = await runPlan($, ctx, plan, id)
+    await rememberRun($, rec).catch(() => undefined)
+    await bumpStats($, s => {
+      s.orchestrations += 1
+    }).catch(() => undefined)
+    $.ui.status(undefined)
+    $.ui.toast(`Hmind: run ${id} finished, ${rec.tasks.filter(t => t.status === 'done').length}/${rec.tasks.length} done, ${money(rec.usd)}`)
+    await $.prompt.submit({ text: `Hmind run ${id} has finished. Act on the result below.\n\n${runText(rec, ctx.parentModel)}` })
+  } catch (err) {
+    $.ui.status(undefined)
+    $.ui.toast(`Hmind: run ${id} failed: ${String(err).slice(0, 100)}`)
+    await $.prompt.submit({ text: `Hmind run ${id} failed before it could finish: ${String(err).slice(0, 500)}. The board at ${boardDirFor(ctx.root, id)} holds what the tasks wrote; /hmind runs may hold a partial record.` }).catch(() => undefined)
+  } finally {
+    sh.runs -= 1
+    sh.live = undefined
+  }
+}
+
+const liveText = (sh: Shared): string =>
+  sh.live ? `in flight: run ${sh.live.id} "${sh.live.goal.slice(0, 60)}", ${sh.live.phase}, ${sh.live.done}/${sh.live.total} done, ${sh.live.running} running, ${money(sh.live.usd)} so far, ${duration(Date.now() - sh.live.startedAt)}\n` : ''
+
 // ------------------------------------------------------------ surface
 
 async function registerSurface($: EngineInterface, withOrchestrate: boolean): Promise<void> {
   await $.command.register({
     name: 'hmind',
     description: 'Hmind: stats, usage and cost by model, decisions, rules, verify, on/off',
-    argumentHint: '[usage [all]|agents|runs|run <id>|report <agent>|log|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
+    argumentHint: '[usage|cost|tokens [all]|agents|runs|run <id>|report <agent>|log|rules|budget|verify [on|off]|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
   })
   await $.tool.register({
     name: 'decide',
@@ -297,7 +337,7 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
   const u = summarize(await loadLedger($, 'session'))
   return [
     `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions by ${cfg.judgeModel} (${s.unanswered} unanswered), avg ${answered ? `${Math.round(s.claudeMs / answered)} ms` : 'n/a'} each`,
-    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings, ${s.orchestrations} orchestrated runs, ${s.agentsHeld} agents held for a slot, ${s.agentsDeduped} duplicate agents refused, ${s.reportsDigested} agent reports digested`,
+    `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings, ${s.orchestrations} orchestrated runs, ${s.agentsHeld} agents held for a slot, ${s.agentsDeduped} duplicate agents refused, ${s.reportsDigested} agent reports digested, ${s.handbacksDropped} hand-backs absorbed`,
     `  labels: ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
     `  budget: ${sh.opt.budgetMode ? describePressure(sh.pressure) || `normal (${sh.pressure.percent}% of the ${sh.pressure.window} window)` : 'budget mode off'}`,
     `  usage this session: Claude ${money(u.claudeUsd)}${u.mainModel ? ` (${u.mainModel}, ${u.requests} requests)` : ''}, Hmind's own calls ${money(u.ownUsd)}, est. ${money(u.savedUsd)} saved at list prices; /hmind usage for the breakdown by model`,
@@ -392,6 +432,7 @@ export const register: Register = (on, options) => {
     orchestrated: new Map(),
     runs: 0,
     waiting: new Map(),
+    recentAgents: new Set(),
   }
   const { opt } = sh
   let lastLevel = 'normal'
@@ -662,10 +703,10 @@ export const register: Register = (on, options) => {
     if (e.agentId !== undefined) return { result: 'error: orchestrate runs from the main conversation only; a subagent cannot start a plan.' }
     const plan = parsePlan(e)
     if (typeof plan === 'string') return { result: `error: ${plan}` }
-    if (sh.runs > 0) return { result: 'error: a plan is already running; wait for its result before starting another.' }
-    sh.runs += 1
-    try {
-      if (opt.budgetMode) sh.pressure = await readPressure($)
+    if (sh.runs > 0) return { result: `error: run ${sh.live?.id ?? '?'} is still in flight (${sh.live ? `${sh.live.done}/${sh.live.total} done` : 'starting'}); its result will arrive as a message. Wait for it before starting another plan.` }
+    if (opt.budgetMode) sh.pressure = await readPressure($)
+    const id = newRunId()
+    {
       const ctx: RunCtx = {
         cfg,
         root: sh.root || (await $.session.cwd()),
@@ -696,19 +737,24 @@ export const register: Register = (on, options) => {
           })
           return { command, ok: r.ok && !r.denied, text: r.denied ? `the run was refused: ${r.denied}` : r.text }
         },
-        progress: text => $.ui.status(text),
+        progress: p => {
+          sh.live = { ...p, goal: plan.goal, startedAt: sh.live?.startedAt ?? Date.now() }
+          $.ui.status(p.text)
+        },
       }
-      $.ui.toast(`Hmind: running ${plan.tasks.length} task${plan.tasks.length === 1 ? '' : 's'}, up to ${ctx.maxParallel} at once`)
-      const rec = await runPlan($, ctx, plan)
-      await rememberRun($, rec)
-      await bumpStats($, s => {
-        s.orchestrations += 1
-      })
-      $.ui.status(undefined)
-      $.ui.toast(`Hmind: run ${rec.id} finished, ${rec.tasks.filter(t => t.status === 'done').length}/${rec.tasks.length} done, ${money(rec.usd)}`)
-      return { result: runText(rec, ctx.parentModel) }
-    } finally {
-      sh.runs -= 1
+      sh.runs += 1
+      sh.recentAgents = new Set([...plan.tasks.map(t => agentNameFor(t.id)), agentNameFor('integrate')])
+      sh.live = { id, phase: 'tasks', done: 0, total: plan.tasks.length, running: 0, usd: 0, text: 'starting', goal: plan.goal, startedAt: Date.now() }
+      $.ui.toast(`Hmind: run ${id} started, ${plan.tasks.length} task${plan.tasks.length === 1 ? '' : 's'}, up to ${ctx.maxParallel} at once`)
+      void startRun($, sh, ctx, plan, id)
+      const first = plan.tasks.filter(t => t.needs.length === 0).map(t => t.id)
+      return {
+        result:
+          `Hmind started run ${id} in the background: ${plan.tasks.length} task${plan.tasks.length === 1 ? '' : 's'}, up to ${ctx.maxParallel} at once; starting now: ${first.slice(0, ctx.maxParallel).join(', ')}. ` +
+          `Lookups run on haiku, mechanical tasks on sonnet, judgment on ${ctx.parentModel}; the agents share the board at ${boardDirFor(ctx.root, id)}. ` +
+          'You will receive the result as a message when the run finishes: one digest per task, the consistency verdict and the cost. ' +
+          'Do not start another plan or launch agents for these tasks meanwhile; /hmind runs shows progress. If nothing else is pending, end your turn and wait.',
+      }
     }
   })
 
@@ -774,6 +820,15 @@ export const register: Register = (on, options) => {
   // ------------------------------------------------------------ next prompt: approvals, boundary compaction
 
   on('prompt.submit', async ($, e, next) => {
+    if (sh.recentAgents.size > 0 && (e.origin.kind === 'peer-send-message' || e.origin.kind === 'peer') && e.command === undefined) {
+      const from = e.text.match(/from="(hmind-[A-Za-z0-9_-]+)"/)?.[1]
+      if (from && sh.recentAgents.has(from)) {
+        await bumpStats($, s => {
+          s.handbacksDropped += 1
+        })
+        return { drop: `Hmind took the report of ${from} into its run; the digest comes with the run's result, the full text with /hmind run <id>.` }
+      }
+    }
     const typed = e.origin.kind === 'composer' || e.origin.kind === 'bridge'
     if (typed && e.command === undefined && !e.isMeta) sh.verifyPrompted = false
 
@@ -871,9 +926,10 @@ export const register: Register = (on, options) => {
     }
     if (verb === 'log') return { text: await logText($) }
     if (verb === 'agents') return { text: agentsText(await $.agent.list().catch(() => []), sh.agents, await $.clock.now()) }
-    if (verb === 'runs') return { text: runsText(await loadRuns($)) }
+    if (verb === 'runs') return { text: `${liveText(sh)}${runsText(await loadRuns($))}` }
     if (verb === 'run' && rest) {
       const rec = (await loadRuns($)).find(r => r.id === rest)
+      if (!rec && sh.live?.id === rest) return { text: `${liveText(sh)}board: ${boardDirFor(sh.root, rest)}` }
       return { text: rec ? runDetail(rec) : `no run ${rest}; /hmind runs lists them.` }
     }
     if (verb === 'report' && rest) {

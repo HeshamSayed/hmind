@@ -1,8 +1,12 @@
 {
   "name": "hmind",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "A second brain and orchestrator for Claude Code: runs plans of subtasks as parallel subagents that share a board, notes and conventions, integrates and verifies the combined work, governs the agents the model launches itself, guards risky commands, trims noisy output, right-sizes effort, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost.",
   "license": "MIT",
+  "author": {
+    "name": "Hesham Sayed",
+    "url": "https://github.com/HeshamSayed"
+  },
   "userConfig": {
     "judgeModel": {
       "type": "string",
@@ -43,7 +47,7 @@
     "agentCap": {
       "type": "number",
       "title": "Agents at once",
-      "description": "Hold a new agent the model launches until fewer than this many are running (0 = no cap; lowered under budget pressure)",
+      "description": "Refuse a new agent the model launches while this many are already running, after holding it a few seconds for a slot (0 = no cap; lowered under budget pressure)",
       "default": 4
     },
     "dedupeAgents": {

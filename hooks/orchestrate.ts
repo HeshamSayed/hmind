@@ -91,7 +91,10 @@ export function parsePlan(raw: unknown): Plan | string {
     if (model !== undefined && !ALIASES.has(model)) return `task "${id}": model must be haiku, sonnet, opus or fable.`
     tasks.push({
       id,
-      description: String(item.description ?? id).slice(0, 60),
+      description: String(item.description ?? id)
+        .replace(/[\r\n|]+/g, ' ')
+        .trim()
+        .slice(0, 60),
       prompt: item.prompt.trim(),
       needs,
       kind: kind as Kind | undefined,
@@ -174,9 +177,10 @@ export function renderBoard(runId: string, plan: Plan, live: Map<string, Live>, 
   const rows = plan.tasks.map(t => {
     const l = live.get(t.id)
     const r = done.get(t.id)
-    return `| ${t.id} | ${r?.status ?? l?.status ?? 'pending'} | ${r?.model ?? l?.model ?? '-'} | ${agentNameFor(t.id)} | ${t.needs.join(', ') || '-'} | ${t.description} | ${r?.files.join(', ') || ''} |`
+    const cell = (text: string) => text.replace(/[\r\n|]+/g, ' ')
+    return `| ${t.id} | ${r?.status ?? l?.status ?? 'pending'} | ${r?.model ?? l?.model ?? '-'} | ${agentNameFor(t.id)} | ${t.needs.join(', ') || '-'} | ${cell(t.description)} | ${cell(r?.files.join(', ') ?? '')} |`
   })
-  const results = [...done.values()].map(r => `### ${r.id} (${r.status}, ${r.model})\n${r.digest}`)
+  const results = [...done.values()].map(r => `### ${r.id} (${r.status}, ${r.model})\n${r.digest.length > 700 ? `${r.digest.slice(0, 700)}…` : r.digest}`)
   return [
     `# Hmind run ${runId}`,
     `Goal: ${plan.goal}`,
@@ -224,7 +228,7 @@ export async function readNotes($: EngineInterface, dir: string): Promise<string
 
 // ---------------------------------------------------------------- prompts and reports
 
-export function taskPrompt(plan: Plan, task: Task, done: Map<string, TaskResult>, live: Map<string, Live>, dir: string, previous?: { model: string; status: Status; tail: string }): string {
+export function taskPrompt(plan: Plan, task: Task, done: Map<string, TaskResult>, live: Map<string, Live>, dir: string | undefined, previous?: { model: string; status: Status; tail: string }): string {
   const deps = task.needs.map(n => done.get(n)).filter((r): r is TaskResult => !!r)
   const others = plan.tasks
     .filter(t => t.id !== task.id)
@@ -238,8 +242,12 @@ export function taskPrompt(plan: Plan, task: Task, done: Map<string, TaskResult>
     `You are running task "${task.id}" of a plan that Hmind is orchestrating for the main assistant. Your agent name is ${agentNameFor(task.id)}.`,
     `Goal of the whole plan: ${plan.goal}`,
     `Your task: ${task.prompt}`,
-    `Plan board: ${boardPath(dir)}. Read it first: it has the contract every task follows, every task with its status and files, and the results so far.`,
-    `Your notes file: ${notesPath(dir, task.id)}. Create it at once with the headings DECISIONS, FILES and OPEN. Write every file you will edit under FILES before you edit it, and every shared name you introduce under DECISIONS with its exact signature. Read the other files in ${notesDir(dir)} before you edit and again before you report.`,
+    ...(dir
+      ? [
+          `Plan board: ${boardPath(dir)}. Read it first: it has the contract every task follows, every task with its status and files, and the results so far.`,
+          `Your notes file: ${notesPath(dir, task.id)}. Create it at once with the headings DECISIONS, FILES and OPEN. Write every file you will edit under FILES before you edit it, and every shared name you introduce under DECISIONS with its exact signature. Read the other files in ${notesDir(dir)} before you edit and again before you report.`,
+        ]
+      : [`Contract every task follows:\n${CONTRACT.filter(c => !/board|notes/i.test(c)).map(c => `- ${c}`).join('\n')}\nFollow the conventions, touch only the files your task needs, and report every shared name you introduce with its exact signature.`]),
     others.length ? `The other tasks of this plan:\n${others.join('\n')}` : 'You are the only task of this plan.',
   ]
   if (plan.conventions) parts.push(`Conventions for this plan:\n${plan.conventions}`)
@@ -252,12 +260,12 @@ export function taskPrompt(plan: Plan, task: Task, done: Map<string, TaskResult>
   return parts.join('\n\n')
 }
 
-export function integratorPrompt(plan: Plan, tasks: TaskResult[], notes: string, dir: string, verify: VerifyOutcome | undefined): string {
+export function integratorPrompt(plan: Plan, tasks: TaskResult[], notes: string, dir: string | undefined, verify: VerifyOutcome | undefined): string {
   const changed = tasks.filter(t => t.files.length)
   return [
     `You are the integrator of a plan that Hmind orchestrated for the main assistant: ${plan.tasks.length} tasks ran as separate agents, and your job is to make their combined work consistent. Your agent name is ${agentNameFor('integrate')}.`,
     `Goal of the plan: ${plan.goal}`,
-    `Plan board: ${boardPath(dir)}. Notes of every task: ${notesDir(dir)}. Read both.`,
+    dir ? `Plan board: ${boardPath(dir)}. Notes of every task: ${notesDir(dir)}. Read both.` : 'No board was written for this run; the reports below are what you have.',
     `Files the tasks changed: ${changed.map(t => `${t.id}: ${t.files.join(', ')}`).join('; ') || 'none reported'}.`,
     `Reports:\n${tasks.map(t => `### ${t.id} (${t.status}, ${t.model})\n${t.digest}`).join('\n\n')}`,
     notes ? `Notes:\n${notes}` : 'No notes files were written.',
@@ -269,19 +277,28 @@ export function integratorPrompt(plan: Plan, tasks: TaskResult[], notes: string,
   ].join('\n\n')
 }
 
+/** The LAST status line of a report (an agent may quote the template before its real footer), with markdown bold or list prefixes allowed. */
 export function statusOf(report: string): Status | undefined {
-  const m = report.match(/^STATUS:\s*(done|partial|blocked|failed)\b/im)
+  const all = [...report.matchAll(/^[\s>*_`-]*STATUS[*_`]*:[*_`\s]*(done|partial|blocked|failed)\b/gim)]
+  const m = all[all.length - 1]
   return m ? (m[1]!.toLowerCase() as Status) : undefined
 }
 
+/** The paths of a report's FILES line, split on commas and semicolons only, so a path with spaces survives. */
 export function filesOf(report: string): string[] {
-  const m = report.match(/^FILES:\s*(.+)$/im)
+  const all = [...report.matchAll(/^[\s>*_`-]*FILES[*_`]*:[*_`]*\s*(.+)$/gim)]
+  const m = all[all.length - 1]
   if (!m) return []
-  return m[1]!
-    .split(/[,\s]+/)
-    .map(f => f.trim().replace(/[`'"]/g, ''))
-    .filter(f => f && !/^(none|n\/a|-|no files?)$/i.test(f))
-    .slice(0, 40)
+  const seen = new Set<string>()
+  for (const raw of m[1]!.split(/[,;]/)) {
+    const f = raw
+      .trim()
+      .replace(/^[`'"(*_]+|[`'")*_]+$/g, '')
+      .replace(/\.$/, '')
+      .trim()
+    if (f && !/^(none|n\/a|-|no files?( changed)?|the paths you changed.*)$/i.test(f)) seen.add(f)
+  }
+  return [...seen].slice(0, 40)
 }
 
 // ---------------------------------------------------------------- running
@@ -290,6 +307,8 @@ export type AgentOutcome = { text: string; usage: Usage; model: string; ms: numb
 export type Launch = (task: Task, model: Alias | undefined, prompt: string) => Promise<AgentOutcome>
 export type Finished = { text: string; usage?: Usage & { model?: string }; reason: string }
 export type Waiter = (o: Finished) => void
+
+export type Progress = { id: string; phase: 'tasks' | 'verify' | 'integrate' | 'finished'; done: number; total: number; running: number; usd: number; text: string }
 
 export type RunCtx = {
   cfg: JudgeConfig
@@ -302,7 +321,7 @@ export type RunCtx = {
   judgeStatus: (task: Task, report: string) => Promise<Status>
   /** run the project's own verification; undefined when none is known */
   verify: () => Promise<{ command: string; ok: boolean; text: string } | undefined>
-  progress: (text: string) => void
+  progress: (p: Progress) => void
 }
 
 /**
@@ -322,15 +341,18 @@ export function makeLauncher($: EngineInterface, waiting: Map<string, Waiter>, o
       }
       const id = r.agentId
       const finished = new Promise<Finished>(resolve => waiting.set(id, resolve))
-      const out = await Promise.race([finished, $.clock.sleep(timeoutMs).then(() => 'timeout' as const)])
+      const timer = new AbortController()
+      const out = await Promise.race([finished, $.clock.sleep(timeoutMs, { signal: timer.signal }).then(() => 'timeout' as const, () => 'timeout' as const)])
       const ms = (await $.clock.now()) - started
+      if (out !== 'timeout') timer.abort()
       if (out === 'timeout') {
         waiting.delete(id)
         await $.tool.call({ tool: 'TaskStop', task_id: id }).catch(() => undefined)
         return { text: '', usage: ZERO, model: r.model, ms, timedOut: true }
       }
       const { model: ended, ...usage } = out.usage ?? { ...ZERO, model: undefined }
-      return { text: out.text.trim(), usage, model: ended ?? r.model, ms, error: out.reason === 'error' || out.reason === 'refusal' ? `the agent ended by ${out.reason}` : undefined }
+      const error = out.reason === 'aborted' ? 'the agent was aborted' : out.reason === 'error' || out.reason === 'refusal' ? `the agent ended by ${out.reason}` : undefined
+      return { text: out.text.trim(), usage, model: ended ?? r.model, ms, error }
     } finally {
       ours.delete(prompt)
     }
@@ -357,7 +379,7 @@ async function runTask($: EngineInterface, ctx: RunCtx, task: Task, model: Alias
     parentUsd += usdOf(ctx.parentModel, out.usage)
     const status: Status = out.timedOut ? 'timeout' : out.error || out.text === '' ? 'failed' : (statusOf(out.text) ?? (await ctx.judgeStatus(task, out.text)))
     last = { text: out.text || out.error || '', status, model: out.model }
-    if (status === 'done' || status === 'partial' || !ctx.retry) break
+    if (status === 'done' || status === 'partial' || !ctx.retry || out.error === 'the agent was aborted') break
     const up = stepUp(model, ctx.parentModel)
     if (up === null) break
     previous = { model: out.model, status, tail: last.text.slice(-1200) }
@@ -369,9 +391,10 @@ async function runTask($: EngineInterface, ctx: RunCtx, task: Task, model: Alias
 
 const tailOf = (text: string) => text.trim().split('\n').slice(-25).join('\n').slice(-2500)
 
-export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan): Promise<RunRecord> {
+export const newRunId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
+
+export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan, id = newRunId()): Promise<RunRecord> {
   const started = await $.clock.now()
-  const id = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`
   const dir = boardDirFor(ctx.root, id)
   const byId = new Map(plan.tasks.map(t => [t.id, t]))
   const done = new Map<string, TaskResult>()
@@ -379,10 +402,22 @@ export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan): Prom
   const pending = new Set(plan.tasks.map(t => t.id))
   const running = new Map<string, Promise<void>>()
   const limit = Math.max(1, Math.min(ctx.maxParallel, plan.maxParallel ?? ctx.maxParallel))
-  const board = (finished = false) => writeBoard($, renderBoard(id, plan, live, done, dir, ctx.parentModel, finished), dir).catch(() => undefined)
-  const report = () => ctx.progress(`Hmind run ${id}: ${done.size}/${plan.tasks.length} done, ${running.size} running, ${money([...done.values()].reduce((s, r) => s + r.usd, 0))}`)
+  let chain: Promise<void> = Promise.resolve()
+  let boardOk = true
+  const board = (finished = false) => {
+    chain = chain.then(() => writeBoard($, renderBoard(id, plan, live, done, dir, ctx.parentModel, finished), dir)).catch(() => undefined)
+    return chain
+  }
+  const spent = () => [...done.values()].reduce((s, r) => s + r.usd, 0)
+  const report = (phase: Progress['phase'] = 'tasks', text?: string) =>
+    ctx.progress({ id, phase, done: done.size, total: plan.tasks.length, running: running.size, usd: spent(), text: text ?? `Hmind run ${id}: ${done.size}/${plan.tasks.length} done, ${running.size} running, ${money(spent())}` })
   await prepareBoardDir($, ctx.root, dir).catch(() => undefined)
-  await board()
+  try {
+    await writeBoard($, renderBoard(id, plan, live, done, dir, ctx.parentModel, false), dir)
+  } catch (err) {
+    boardOk = false
+    ctx.progress({ id, phase: 'tasks', done: 0, total: plan.tasks.length, running: 0, usd: 0, text: `Hmind run ${id}: cannot write the board at ${dir} (${String(err).slice(0, 80)}); the agents run without it` })
+  }
 
   while (pending.size > 0 || running.size > 0) {
     let progressed = false
@@ -407,7 +442,7 @@ export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan): Prom
           ctx,
           t,
           model,
-          previous => taskPrompt(plan, t, done, live, dir, previous),
+          previous => taskPrompt(plan, t, done, live, boardOk ? dir : undefined, previous),
           m => {
             live.set(tid, { status: 'running', model: m })
             void board()
@@ -450,19 +485,20 @@ export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan): Prom
   const changed = tasks.some(t => t.files.length > 0)
   const finished = tasks.filter(t => t.status === 'done' || t.status === 'partial').length
   if (changed && plan.verify) {
-    ctx.progress(`Hmind run ${id}: verifying the combined work`)
+    report('verify', `Hmind run ${id}: verifying the combined work`)
     const v = await ctx.verify().catch(() => undefined)
     if (v) verify.push({ when: 'before', command: v.command, ok: v.ok, tail: tailOf(v.text) })
   }
   const before = verify[0]
   if (plan.integrate && changed && (finished >= 2 || (before && !before.ok))) {
-    ctx.progress(`Hmind run ${id}: integrating ${finished} results on ${ctx.parentModel}`)
-    const notes = await readNotes($, dir).catch(() => '')
+    report('integrate', `Hmind run ${id}: integrating ${finished} results on ${ctx.parentModel}`)
+    await chain
+    const notes = boardOk ? await readNotes($, dir).catch(() => '') : ''
     const task: Task = { id: 'integrate', description: 'integrate the plan', prompt: '', needs: [] }
     live.set('integrate', { status: 'running', model: ctx.parentModel })
-    integration = await runTask($, { ...ctx, retry: false }, task, undefined, () => integratorPrompt(plan, tasks, notes, dir, before), () => undefined).catch(e => failed(task, `failed: ${String(e).slice(0, 300)}`))
+    integration = await runTask($, { ...ctx, retry: false }, task, undefined, () => integratorPrompt(plan, tasks, notes, boardOk ? dir : undefined, before), () => undefined).catch(e => failed(task, `failed: ${String(e).slice(0, 300)}`))
     if (integration.files.length > 0 && plan.verify && before) {
-      ctx.progress(`Hmind run ${id}: verifying again`)
+      report('verify', `Hmind run ${id}: verifying again`)
       const v = await ctx.verify().catch(() => undefined)
       if (v) verify.push({ when: 'after', command: v.command, ok: v.ok, tail: tailOf(v.text) })
     }
@@ -471,6 +507,7 @@ export async function runPlan($: EngineInterface, ctx: RunCtx, plan: Plan): Prom
   const rec: RunRecord = { id, goal: plan.goal, at: new Date().toISOString(), ms: (await $.clock.now()) - started, dir, tasks, integration, verify, usd: all.reduce((s, r) => s + r.usd, 0), parentUsd: all.reduce((s, r) => s + r.parentUsd, 0) }
   if (integration) done.set('integrate', integration)
   await board(true)
+  report('finished', `Hmind run ${id}: finished, ${money(rec.usd)}`)
   return rec
 }
 

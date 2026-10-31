@@ -2,7 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 
 import { compactAtFor, effortFor, levelOf, trimOverFor } from '../hooks/budget'
 import { ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest } from '../hooks/ledger'
-import { loadRuns, parsePlan, rememberRun, runPlan, runText, runsText } from '../hooks/orchestrate'
+import { filesOf, loadRuns, parsePlan, rememberRun, runPlan, runText, runsText, statusOf } from '../hooks/orchestrate'
 import { isWindowsPath, joinPath } from '../hooks/platform'
 import { money, priceOf, resolveModel, usdOf } from '../hooks/pricing'
 import { matchRule, templateOf } from '../hooks/rules'
@@ -324,6 +324,28 @@ test('the orchestrate tool validates its plan', async ($, on) => {
   expect(String(bad.result)).toBe('error: the tasks depend on each other in a cycle.')
   const missing = await $.tool.call({ tool: 'mcp__hmind__orchestrate', goal: 'goal of the test', tasks: [{ id: 'x', prompt: 'do the thing', needs: ['nope'] }] })
   expect(String(missing.result).includes('not in the plan')).toBe(true)
+})
+
+test('the orchestrate tool answers at once and runs the plan in the background', async ($, on) => {
+  engineBeneath(on)
+  on('agent.list', () => ({ value: [] }))
+  on('agent.spawn', () => ({ model: 'claude-haiku-5-5', agentId: 'never-finishes' }))
+  const r = await $.tool.call({ tool: 'mcp__hmind__orchestrate', goal: 'goal of the test', tasks: [{ id: 'x', prompt: 'look something up', kind: 'lookup' }] })
+  expect(String(r.result).startsWith('Hmind started run ')).toBe(true)
+  expect(String(r.result).includes('starting now: x')).toBe(true)
+  const again = await $.tool.call({ tool: 'mcp__hmind__orchestrate', goal: 'goal of the test', tasks: [{ id: 'y', prompt: 'look something else up' }] })
+  expect(String(again.result).includes('still in flight')).toBe(true)
+  const runs = (await $.command.run({ command: 'hmind', args: 'runs' })).text ?? ''
+  expect(runs.startsWith('in flight: run ')).toBe(true)
+})
+
+test('FILES lines keep paths with spaces and drop none', async () => {
+  expect(filesOf('STATUS: done\nFILES: /Users/me/syra org/app/README.md, `src/a b.ts`; C:\\work\\x.ts\nSUMMARY: x').join('|')).toBe('/Users/me/syra org/app/README.md|src/a b.ts|C:\\work\\x.ts')
+  expect(filesOf('FILES: none').length).toBe(0)
+  expect(filesOf('no files line').length).toBe(0)
+  expect(filesOf('The template says:\nFILES: the paths you changed, comma-separated, or none\n...\n**FILES:** (src/x.ts), src/x.ts\nSUMMARY: y').join('|')).toBe('src/x.ts')
+  expect(statusOf('STATUS: done | partial | blocked | failed\nwork...\n- STATUS: failed')).toBe('failed')
+  expect(statusOf('**STATUS:** partial')).toBe('partial')
 })
 
 test('an agent that duplicates one already running is refused with its id', async ($, on) => {
