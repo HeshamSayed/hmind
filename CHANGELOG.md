@@ -5,7 +5,8 @@ Release notes for Hmind, a decision-layer plugin for Claude Code.
 ## 0.7.2
 
 - The shell guard no longer trusts a safe-looking prefix: a command that chains, pipes or substitutes (`pwd && rm -rf .git`) is judged whole. Found while recording the demo, where the model chained the destructive command behind `pwd`.
-- A recorded demo of a real session, `demo/hmind.gif` and `demo/hmind.mp4`, made with VHS from `demo/hmind.tape`.
+- A demo of a real session recorded with VHS from `demo/hmind.tape`; the GIF and MP4 it produces are ignored by git.
+- README rewritten with a quick start, reference tables for commands and settings, and an FAQ; an MIT license file; author email in the manifest.
 
 ## 0.7.1
 
