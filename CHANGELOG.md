@@ -2,6 +2,11 @@
 
 Release notes for Hmind, a decision-layer plugin for Claude Code.
 
+## 0.7.1
+
+- The two orchestration questions are measured: 12 labeled duplicate-agent cases and 10 task-outcome cases in `eval/cases-agents.mts`, run by the same harness; Haiku scores 100% on both, and on every other kind, over 74 cases.
+- Two question wordings sharpened from the misses: a report-only task whose report delivers what was asked counts as done, and the done-claim check judges what a message claims rather than whether the claim could be true.
+
 ## 0.7.0
 
 - Orchestrated runs happen in the background: the `orchestrate` tool answers at once with the run id and the first wave, and the result reaches the model as a message when the run finishes (a tool call's hook has a ten-second budget, so a run cannot live inside it).

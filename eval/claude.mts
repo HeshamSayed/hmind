@@ -1,8 +1,10 @@
 // Approximates the Claude tier on the same cases with one batched `claude -p` call per kind.
 // Usage: node haiku.mts [model alias]
 import { spawnSync } from 'node:child_process'
-import { cases, report, tally } from './cases.mts'
+import { cases as baseCases, report, tally } from './cases.mts'
+import { agentCases } from './cases-agents.mts'
 
+const cases = [...baseCases, ...agentCases]
 const model = process.argv[2] ?? 'haiku'
 const LETTERS = 'ABCDEFGHIJ'
 const optionsOf = (q: any): string[] => (q.type === 'noul' ? ['yes', 'no'] : q.options)

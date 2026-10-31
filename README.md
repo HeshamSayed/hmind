@@ -66,7 +66,7 @@ The tool answers at once with the run id and the first wave, and the run continu
 
 A task may name a `model` outright (never above the parent) or a `subagentType`. `maxParallel` caps the wave, and budget pressure lowers it on its own; under high pressure every task runs one at a time. `integrate: false` or `verify: false` skip those passes.
 
-## Measured (52 labeled cases, `eval/`)
+## Measured (74 labeled cases, `eval/`)
 
 | Decision | Claude Haiku |
 | --- | --- |
@@ -74,6 +74,8 @@ A task may name a `model` outright (never above the parent) or a `subagentType`.
 | effort (trivial / small / large) | 100% |
 | trim (all / head+tail / errors) | 100% |
 | done claim (asserts finished?) | 100% |
+| duplicate agent (same work?) | 100% |
+| task outcome (done / partial / not done) | 100% |
 | latency per batch of decisions | 0.4 to 0.8 s |
 
 Re-run the eval before trusting another judge model or changing a question's wording:

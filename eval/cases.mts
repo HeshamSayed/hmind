@@ -80,9 +80,9 @@ export const tally = () => new Map<string, Tally>()
 export const mean = (xs: number[]) => (xs.length ? (xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(2) : '-')
 export function report(title: string, byKind: Map<string, Tally>, threshold: number, wrongs: string[]) {
   console.log(title)
-  console.log(`kind     n  acc   conf(right) conf(wrong)  covered@${threshold}  acc@covered  avg ms`)
+  console.log(`kind       n  acc   conf(right) conf(wrong)  covered@${threshold}  acc@covered  avg ms`)
   for (const [kind, k] of byKind)
-    console.log(`${kind.padEnd(7)} ${String(k.n).padStart(2)}  ${(k.right / k.n).toFixed(2)}  ${mean(k.confRight).padStart(6)}      ${mean(k.confWrong).padStart(6)}      ${String(k.covered).padStart(2)}/${k.n}          ${k.covered ? (k.coveredRight / k.covered).toFixed(2) : '-'}      ${Math.round(k.ms / k.n)}`)
+    console.log(`${kind.padEnd(9)} ${String(k.n).padStart(2)}  ${(k.right / k.n).toFixed(2)}  ${mean(k.confRight).padStart(6)}      ${mean(k.confWrong).padStart(6)}      ${String(k.covered).padStart(2)}/${k.n}          ${k.covered ? (k.coveredRight / k.covered).toFixed(2) : '-'}      ${Math.round(k.ms / k.n)}`)
   if (wrongs.length) {
     console.log('wrong:')
     for (const w of wrongs) console.log(w)

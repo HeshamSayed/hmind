@@ -18,7 +18,7 @@ export const dupQuestion: Question = {
     'Different files, a different question, a review of the other agent\'s result, or a follow-up step do NOT count as the same work.',
 }
 
-export const OUTCOME_OPTIONS = ['done: the task was completed as asked', 'partial: some of it was done and the rest is stated', 'not done: it was blocked, failed, abandoned, or the report only describes a plan'] as const
+export const OUTCOME_OPTIONS = ['done: the task was completed as asked, including a report-only task whose report delivers what was asked', 'partial: some of it was done and the rest is stated', 'not done: it was blocked, failed, abandoned, or the report only describes a plan'] as const
 
 export const outcomeState = (task: string, report: string) => `TASK\n${task.slice(0, 2000)}\n\nREPORT\n${report.slice(0, 12000)}`
 
@@ -89,7 +89,8 @@ export const claimsQuestion: Question = {
   id: 'claims',
   type: 'noul',
   statement:
-    'The message asserts that the work is finished, fixed, working, passing, or verified. ' +
+    'The message asserts that the work is finished, fixed, working, passing, or verified. Judge only what the message claims, not whether the claim could be true: ' +
+    'a message that says the tests pass asserts it even though nothing was run. ' +
     'A message that says it has NOT been tested or verified, asks a question, proposes a plan, or says what it will do next does not assert that.',
 }
 
