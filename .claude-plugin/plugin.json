@@ -38,7 +38,7 @@
       "type": "string",
       "title": "Local trust per kind (starting values)",
       "description": "kind=threshold pairs: the local confidence at which a local answer stands without asking Claude (1 = always ask). Self-calibration moves these; /hmind trust shows the live values",
-      "default": "gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1"
+      "default": "gate=0.85,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1"
     },
     "shadowRate": {
       "type": "number",

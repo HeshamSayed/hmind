@@ -23,7 +23,7 @@ for (const kind of kinds) {
     '{"id":<item number>,"answer":"<option letter>","confidence":<0..1>}. confidence is the probability that your answer is right. No prose, nothing but JSON lines.\n\n' +
     spec
   const t0 = Date.now()
-  const r = spawnSync('claude', ['-p', '--model', model, '--output-format', 'text', '--no-session-persistence', prompt], { encoding: 'utf8', maxBuffer: 1 << 24 })
+  const r = spawnSync('claude', ['-p', '--model', model, '--output-format', 'text', '--no-session-persistence', prompt], { encoding: 'utf8', maxBuffer: 1 << 24, shell: process.platform === 'win32' })
   const ms = Date.now() - t0
   const answers = new Map<number, { letter: string; confidence: number }>()
   for (const line of (r.stdout ?? '').split('\n')) {

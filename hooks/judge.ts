@@ -144,7 +144,8 @@ async function localLogprobs(
       $.clock.sleep(cfg.localTimeoutMs).then(() => undefined),
     ])
   let res = await call(!noThinkSwitch.has(cfg.ollamaModel))
-  if (res && !res.ok && !noThinkSwitch.has(cfg.ollamaModel)) {
+  if (res && res.status === 400 && !noThinkSwitch.has(cfg.ollamaModel)) {
+    // Ollama refuses `think` for a model without a thinking switch: ask once more without it.
     noThinkSwitch.add(cfg.ollamaModel)
     res = await call(false)
   }

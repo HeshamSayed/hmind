@@ -46,12 +46,15 @@ const KEEP_RULES =
   'the exact commands used to run, build and test, with their last result; open errors and what was tried; decisions made and why; what remains. ' +
   'Drop: file contents, long tool outputs, resolved dead ends, exploration that led nowhere.'
 
+// Read-only commands that are never judged (Unix shells, Git Bash on Windows, and PowerShell).
 const SAFE_BASH =
-  /^\s*(ls|cat|head|tail|wc|grep|rg|fd|pwd|which|echo|printf|stat|file|du|df|env|printenv|date|uname|sw_vers|sysctl|git (status|log|diff|show|branch|remote|rev-parse|ls-files|blame)|npm (ls|list|view|outdated|test)|pnpm (ls|test)|yarn (test|lint)|node -v|python3? (-V|--version)|pip3? (list|show)|tsc\b|cargo (check|test|build)|go (test|build|vet)|pytest|vitest|jest)\b/
+  /^\s*(ls|cat|head|tail|wc|grep|rg|fd|pwd|which|where|echo|printf|stat|file|du|df|env|printenv|date|uname|sw_vers|sysctl|dir|type|tree|Get-ChildItem|Get-Content|Get-Location|Get-Item|Select-String|Get-Process|Get-Date|gci|gc|git (status|log|diff|show|branch|remote|rev-parse|ls-files|blame)|npm (ls|list|view|outdated|test)|pnpm (ls|test)|yarn (test|lint)|node -v|python3? (-V|--version)|py -(V|-version)|pip3? (list|show)|tsc\b|cargo (check|test|build)|go (test|build|vet)|dotnet (test|build)|pytest|vitest|jest)\b/i
+// Markers that make a command worth judging (Unix, Windows cmd, and PowerShell forms).
 const RISKY =
-  /\brm\b|\bmv\b|--force|\s-f\b|-rf\b|reset --hard|checkout -- |\bpush\b|\bsudo\b|\bchmod\b|\bchown\b|\bdd\b|mkfs|\btruncate\b|\bDROP\b|\bDELETE\b|\bTRUNCATE\b|\bkill\b|pkill|killall|launchctl|defaults write|git clean|\brebase\b|\bshred\b|:\(\)\s*\{|>\s*\/|\b(curl|wget)\b.*\|\s*(ba|z)?sh\b|diskutil|\bcrontab\b|\bsystemctl\b|\bbrew (uninstall|remove)\b|npm (uninstall|publish|unpublish)|pip3? uninstall/i
+  /\brm\b|\bmv\b|--force|\s-f\b|-rf\b|reset --hard|checkout -- |\bpush\b|\bsudo\b|\bchmod\b|\bchown\b|\bdd\b|mkfs|\btruncate\b|\bDROP\b|\bDELETE\b|\bTRUNCATE\b|\bkill\b|pkill|killall|launchctl|defaults write|git clean|\brebase\b|\bshred\b|:\(\)\s*\{|>\s*\/|\b(curl|wget)\b.*\|\s*(ba|z)?sh\b|diskutil|\bcrontab\b|\bsystemctl\b|\bbrew (uninstall|remove)\b|npm (uninstall|publish|unpublish)|pip3? uninstall|\bdel\b|\berase\b|\brd\b|\brmdir\b|\bformat\b|\bdiskpart\b|Remove-Item|Remove-ItemProperty|Clear-Content|Format-Volume|Clear-Disk|Initialize-Disk|Stop-Process|taskkill|Stop-Computer|Restart-Computer|\bshutdown\b|\bbcdedit\b|\breg (delete|add)\b|\bicacls\b|\btakeown\b|Set-ExecutionPolicy|Invoke-Expression|\biex\b|Invoke-WebRequest.*\|\s*iex|\birm\b.*\|\s*iex|\bschtasks\b|\bnet (user|localgroup)\b|\bsc (delete|config)\b|\bwmic\b|Set-ItemProperty.*HK(LM|CU)/i
+// Commands that count as verifying the work (tests, builds, type checks, runs) on any platform.
 const VERIFY =
-  /\b(npm|pnpm|yarn|bun)\s+(test|run\s+(test|build|lint|typecheck|check|e2e|dev))\b|\bpytest\b|\bvitest\b|\bjest\b|\bcargo (test|build|check|clippy|run)\b|\bgo (test|build|vet|run)\b|\btsc\b|\bmvn\b|\bgradle\b|\bmake\b|\bflutter (test|analyze|build|run)\b|\bdart (test|analyze)\b|\bphpunit\b|\brspec\b|\beslint\b|\bruff\b|\bmypy\b|\bxcodebuild\b|\bdotnet (test|build|run)\b|\bcurl\b.*(localhost|127\.0\.0\.1)|\bnpx playwright\b|\bcypress\b|\bpython3? (-m pytest|.*test)|\bnode .*test/i
+  /\b(npm|pnpm|yarn|bun)\s+(test|run\s+(test|build|lint|typecheck|check|e2e|dev))\b|\bpytest\b|\bvitest\b|\bjest\b|\bcargo (test|build|check|clippy|run)\b|\bgo (test|build|vet|run)\b|\btsc\b|\bmvnw?(\.cmd)?\b|\bgradlew?(\.bat)?\b|\bmake\b|\bflutter (test|analyze|build|run)\b|\bdart (test|analyze)\b|\bphpunit\b|\brspec\b|\beslint\b|\bruff\b|\bmypy\b|\bxcodebuild\b|\bdotnet (test|build|run)\b|\bmsbuild\b|\bcurl\b.*(localhost|127\.0\.0\.1)|Invoke-WebRequest.*(localhost|127\.0\.0\.1)|\bnpx playwright\b|\bcypress\b|\b(python3?|py)\b.*(-m pytest|test)|\bnode .*test|\bmix test\b/i
 
 type TurnState = { prompt: string; edits: number; verifications: number; bash: number }
 type PendingTrim = { norm: string; id: string; callsLeft: number }
@@ -352,7 +355,7 @@ export const register: Register = (on, options) => {
     mainTurn: undefined,
     turns: new Map(),
     pendingTrims: [],
-    trust: { trust: parseTrust(options.localTrust ?? 'gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1', cfg.confidence), samples: {}, adjustments: [], checks: 0, agreements: 0 },
+    trust: { trust: parseTrust(options.localTrust ?? 'gate=0.85,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1', cfg.confidence), samples: {}, adjustments: [], checks: 0, agreements: 0 },
     rules: [],
     pressure: { level: 'normal', percent: 0, window: 'none' },
     root: '',

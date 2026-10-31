@@ -1,7 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { compactAtFor, effortFor, levelOf, trimOverFor } from '../hooks/budget'
+import { isWindowsPath, joinPath } from '../hooks/platform'
 import { matchRule, templateOf } from '../hooks/rules'
+import { detectWith } from '../hooks/verify'
 
 const NO_USAGE = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 const DOWN = { value: { status: 500, ok: false, headers: {}, text: '' } }
@@ -129,6 +131,51 @@ test('budget pressure maps to effort, trim and compaction', async () => {
   expect(effortFor('critical', 'large', 'low')).toBe('low')
   expect(trimOverFor('high', 6000)).toBe(3000)
   expect(compactAtFor('critical', 55)).toBe(25)
+})
+
+test('a PowerShell command with a risky marker is judged like a Unix one', async ($, on) => {
+  const asked: string[] = []
+  engineBeneath(on, {
+    fetch: e => {
+      const s = JSON.stringify(e)
+      if (s.includes('api/chat')) asked.push(s)
+      return DOWN
+    },
+  })
+  await start($)
+  await $.tool.call({ tool: 'Bash', command: 'Remove-Item -Recurse -Force C:\\Users\\me\\Documents' })
+  await $.tool.call({ tool: 'Bash', command: 'Get-ChildItem -Recurse src' })
+  expect(asked.some(s => s.includes('Remove-Item'))).toBe(true)
+  expect(asked.some(s => s.includes('Get-ChildItem'))).toBe(false)
+})
+
+test('verify commands follow the platform of the project root', async () => {
+  const files = new Set<string>()
+  const fs = {
+    exists: async (p: string) => [...files].some(f => p.endsWith(f)),
+    read: async () => JSON.stringify({ scripts: { test: 'vitest run' } }),
+    list: async () => [],
+  }
+  files.add('package.json')
+  expect(await detectWith(fs, 'C:\\work\\app')).toBe('npm test')
+  files.clear()
+  files.add('pytest.ini')
+  expect((await detectWith(fs, 'C:\\work\\app'))?.startsWith('python -m pytest')).toBe(true)
+  expect((await detectWith(fs, '/home/dev/app'))?.startsWith('python3 -m pytest')).toBe(true)
+  files.clear()
+  files.add('build.gradle.kts')
+  files.add('gradlew.bat')
+  expect(await detectWith(fs, 'C:\\work\\app')).toBe('gradlew.bat test -q')
+  expect(await detectWith(fs, '/home/dev/app')).toBe('./gradlew test -q')
+  files.clear()
+  expect(await detectWith(fs, '/home/dev/empty')).toBeUndefined()
+})
+
+test('paths join with the root platform separator', async () => {
+  expect(isWindowsPath('C:\\work\\app')).toBe(true)
+  expect(isWindowsPath('/home/dev/app')).toBe(false)
+  expect(joinPath('C:\\work\\app\\', 'package.json')).toBe('C:\\work\\app\\package.json')
+  expect(joinPath('/home/dev/app', 'package.json')).toBe('/home/dev/app/package.json')
 })
 
 test('rule templates mask numbers and ids and fold whitespace', async () => {

@@ -39,13 +39,13 @@ A local answer stands only above its kind's trust; otherwise the question escala
 
 | Decision | qwen2.5 1.5B | qwen2.5 7B | Claude Haiku |
 | --- | --- | --- | --- |
-| gate (destructive?) | 90% (100% on the 9/20 it is sure of) | 85% | 100% |
+| gate (destructive?) | 80% (90% on the 10/20 it is sure of) | 85% | 100% |
 | effort (trivial / small / large) | 50% | 86% | 100% |
 | trim (all / head+tail / errors) | 38% | 100% | 100% |
 | done claim (asserts finished?) | 90% (100% on the 5/10 it is sure of) | 70% | 100% |
 | latency per decision | 0.3 s (trim 1.3 s) | 0.7 to 5.8 s | 0.4 to 0.8 s batched |
 
-So the small model starts trusted on the yes/no questions it scores 90% on and not on the three-way choices; those go to Claude until the calibration earns them back. A bigger local model is not a free upgrade: the 7B is overconfident when wrong. Re-run the eval before trusting any model on more kinds:
+So the small model starts trusted on the done-claim question, trusted only when very sure (0.85) on the shell gate, where a wrong "safe" is the costly direction, and not at all on the three-way choices; those go to Claude until the calibration earns them back. A bigger local model is not a free upgrade: the 7B is overconfident when wrong. Re-run the eval before trusting any model on more kinds:
 
 ```sh
 node eval/local.mts qwen2.5:1.5b-instruct   # the local tier
@@ -64,7 +64,19 @@ Answer `y` to add the marketplace, then pick a scope (user is the usual choice).
 
 ## Setup
 
-Ollama must be installed (`brew install ollama`) for the fast tier. Hmind starts `ollama serve` if it is not running and pulls the model on first use. Without Ollama, every decision goes to Claude.
+Hmind runs wherever Claude Code runs: macOS, Linux and Windows. The fast tier needs Ollama; without it every decision goes to Claude and everything still works.
+
+| Platform | Install Ollama |
+| --- | --- |
+| macOS | `brew install ollama`, or the app from ollama.com |
+| Linux | `curl -fsSL https://ollama.com/install.sh \| sh` (installs a systemd service) |
+| Windows | `winget install Ollama.Ollama`, or the installer from ollama.com (runs in the tray) |
+
+Hmind starts `ollama serve` itself when nothing is listening on the Ollama port, and pulls the small model on first use (about 1 GB).
+
+On Windows the shell guard understands PowerShell and `cmd` forms as well as the Git Bash ones Claude Code uses: `Remove-Item -Recurse -Force`, `rd /s /q`, `del`, `format`, `diskpart`, `Stop-Process`, `reg delete`, `Set-ExecutionPolicy`, `irm ... | iex` and friends are judged like `rm -rf` and `curl | sh`. Auto-verify spells its commands for the platform too (`python` and `gradlew.bat` on Windows, `python3` and `./gradlew` elsewhere) and recognises npm, pnpm, yarn, bun, pytest, Cargo, Go, Flutter, Mix, Gradle, Maven, .NET, Make, RSpec and PHPUnit projects.
+
+The eval scripts need Node 22.6 or newer (`node --experimental-strip-types` on 22, plain `node` on 23 and later).
 
 ## Commands
 
