@@ -2,6 +2,8 @@
 
 **A second brain and an orchestrator for Claude Code.** Every coding session is full of small judgment calls: is this command safe to run, does this output matter, how hard should the model think about this prompt, which model should this subagent get, is the work really done, is now a good time to compact? Hmind answers them for a few hundred tokens each and acts only when it is sure. Hand it a plan and it runs the pieces as parallel subagents on the cheapest adequate model, retries what fails, digests what comes back and prices the run. The result is leaner sessions, fewer wasted tokens, safer hands on the shell, work that fans out without the main model babysitting it, and decisions you can audit.
 
+**Demo.** `demo/hmind.tape` records a real session with [VHS](https://github.com/charmbracelet/vhs): the shell guard refuses `rm -rf .git` and says why, `/hmind usage` shows the ledger, and a two-task orchestration finishes in 17 seconds for $0.06. Run `vhs demo/hmind.tape` in the repo to produce `demo/hmind.gif` and `demo/hmind.mp4`.
+
 ## Why you will feel it
 
 - **It orchestrates, so the main model does not have to.** The model writes the plan: tasks with ids, prompts and the ids each one needs. Hmind runs independent tasks at once, each on the cheapest model adequate for its kind (lookups on Haiku, mechanical changes on Sonnet, judgment on the parent model), feeds each task the digested results of the ones it depends on, retries a failed or stalled task once on a stronger model, stops a task that runs past its time, and hands back one digest per task with status, model, tokens and cost. The main model reads a page, not twenty reports.

@@ -91,6 +91,15 @@ test('a command the judge calls destructive is refused, and the judge call is co
   expect(shown.includes("Hmind's own Claude calls: <$0.01")).toBe(true)
 })
 
+test('a destructive command chained behind a safe one is still judged and refused', async ($, on) => {
+  engineBeneath(on, { complete: () => judgeSays('destructive', 'A') })
+  await start($)
+  const ran = await $.tool.call({ tool: 'Bash', command: 'pwd && git log --oneline | head -5 && rm -rf .git && ls -a' })
+  expect(typeof ran.deny).toBe('string')
+  const plain = await $.tool.call({ tool: 'Bash', command: 'git log --oneline | head -5' })
+  expect(plain.deny).toBeUndefined()
+})
+
 test('a learned allow rule skips the gate', async ($, on) => {
   let judged = 0
   engineBeneath(on, {

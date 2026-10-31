@@ -60,6 +60,8 @@ const KEEP_RULES =
 // Read-only commands that are never judged (Unix shells, Git Bash on Windows, and PowerShell).
 const SAFE_BASH =
   /^\s*(ls|cat|head|tail|wc|grep|rg|fd|pwd|which|where|echo|printf|stat|file|du|df|env|printenv|date|uname|sw_vers|sysctl|dir|type|tree|Get-ChildItem|Get-Content|Get-Location|Get-Item|Select-String|Get-Process|Get-Date|gci|gc|git (status|log|diff|show|branch|remote|rev-parse|ls-files|blame)|npm (ls|list|view|outdated|test)|pnpm (ls|test)|yarn (test|lint)|node -v|python3? (-V|--version)|py -(V|-version)|pip3? (list|show)|tsc\b|cargo (check|test|build)|go (test|build|vet)|dotnet (test|build)|pytest|vitest|jest)\b/i
+// A command that chains or substitutes other commands: a safe prefix then proves nothing about the rest.
+const CHAINED = /&&|\|\||;|\||\$\(|`|\n/
 // Markers that make a command worth judging (Unix, Windows cmd, and PowerShell forms).
 const RISKY =
   /\brm\b|\bmv\b|--force|\s-f\b|-rf\b|reset --hard|checkout -- |\bpush\b|\bsudo\b|\bchmod\b|\bchown\b|\bdd\b|mkfs|\btruncate\b|\bDROP\b|\bDELETE\b|\bTRUNCATE\b|\bkill\b|pkill|killall|launchctl|defaults write|git clean|\brebase\b|\bshred\b|:\(\)\s*\{|>\s*\/|\b(curl|wget)\b.*\|\s*(ba|z)?sh\b|diskutil|\bcrontab\b|\bsystemctl\b|\bbrew (uninstall|remove)\b|npm (uninstall|publish|unpublish)|pip3? uninstall|\bdel\b|\berase\b|\brd\b|\brmdir\b|\bformat\b|\bdiskpart\b|Remove-Item|Remove-ItemProperty|Clear-Content|Format-Volume|Clear-Disk|Initialize-Disk|Stop-Process|taskkill|Stop-Computer|Restart-Computer|\bshutdown\b|\bbcdedit\b|\breg (delete|add)\b|\bicacls\b|\btakeown\b|Set-ExecutionPolicy|Invoke-Expression|\biex\b|Invoke-WebRequest.*\|\s*iex|\birm\b.*\|\s*iex|\bschtasks\b|\bnet (user|localgroup)\b|\bsc (delete|config)\b|\bwmic\b|Set-ItemProperty.*HK(LM|CU)/i
@@ -553,7 +555,8 @@ export const register: Register = (on, options) => {
     }
     sh.pendingTrims = sh.pendingTrims.filter(p => p.callsLeft > 0)
 
-    if (sh.enabled && opt.bashGuard && RISKY.test(e.command) && !SAFE_BASH.test(e.command)) {
+    const plainlySafe = SAFE_BASH.test(e.command) && !CHAINED.test(e.command)
+    if (sh.enabled && opt.bashGuard && RISKY.test(e.command) && !plainlySafe) {
       const rule = matchRule(sh.rules, sh.root, e.command)
       if (rule) {
         await bumpStats($, s => {

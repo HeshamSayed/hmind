@@ -2,6 +2,11 @@
 
 Release notes for Hmind, a decision-layer plugin for Claude Code.
 
+## 0.7.2
+
+- The shell guard no longer trusts a safe-looking prefix: a command that chains, pipes or substitutes (`pwd && rm -rf .git`) is judged whole. Found while recording the demo, where the model chained the destructive command behind `pwd`.
+- A recorded demo of a real session, `demo/hmind.gif` and `demo/hmind.mp4`, made with VHS from `demo/hmind.tape`.
+
 ## 0.7.1
 
 - The two orchestration questions are measured: 12 labeled duplicate-agent cases and 10 task-outcome cases in `eval/cases-agents.mts`, run by the same harness; Haiku scores 100% on both, and on every other kind, over 74 cases.
