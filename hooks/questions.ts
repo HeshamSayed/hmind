@@ -1,6 +1,6 @@
 // The typed questions the mod asks, and how each state is written for the judge.
 // Kept in one place so the hooks and the eval harness ask exactly the same thing.
-// Wording matters more for a small local model than for Claude: each question
+// Wording matters: each question
 // says what does NOT count, since that is where a small model over-triggers.
 
 import type { Question } from './judge'

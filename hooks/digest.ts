@@ -17,14 +17,14 @@ const SYSTEM =
 export async function digest($: EngineInterface, cfg: JudgeConfig, command: string, out: string): Promise<string | undefined> {
   const clipped = out.length > 60000 ? `${out.slice(0, 30000)}\n…[${out.length - 60000} chars omitted]…\n${out.slice(-30000)}` : out
   const r = await $.model.complete({
-    model: cfg.escalateModel,
+    model: cfg.judgeModel,
     system: SYSTEM,
     prompt: `Command: ${command.slice(0, 500)}\nOutput (${out.length} chars):\n${clipped}`,
     effort: 'low',
     maxTokens: 1200,
     timeoutMs: 25000,
   })
-  await recordModelCall($, 'digest', cfg.escalateModel, r.usage).catch(() => undefined)
+  await recordModelCall($, 'digest', cfg.judgeModel, r.usage).catch(() => undefined)
   if (!r.isAnswered || r.text.trim().length < 10) return undefined
   return r.text.trim()
 }

@@ -1,6 +1,5 @@
 // The usage ledger: every model call the session makes, by who made it and on which model,
-// with the tokens it cost at list price; the local judge's own token counts; and the tokens
-// Hmind kept out of the context window, priced by what re-reading them would have cost.
+// with the tokens it cost at list price, and the tokens Hmind kept out of the context window, priced by what re-reading them would have cost.
 // Two copies live in the store: this session's (keyed by when it began) and all sessions'.
 
 import type { EngineInterface } from 'claude-code'
@@ -26,7 +25,6 @@ export type Line = {
 export type Ledger = {
   since: string
   lines: Record<string, Line>
-  local: { calls: number; prompt: number; output: number }
   avoided: {
     /** tokens currently kept out of the live window (reset by a compaction) */
     tokens: number
@@ -51,7 +49,6 @@ let chain: Promise<void> = Promise.resolve()
 export const emptyLedger = (): Ledger => ({
   since: new Date().toISOString(),
   lines: {},
-  local: { calls: 0, prompt: 0, output: 0 },
   avoided: { tokens: 0, fresh: 0, total: 0, rereads: 0, rereadTokens: 0, usd: 0 },
   requests: 0,
   notPriced: { effortLowered: 0, compactions: 0 },
@@ -66,7 +63,7 @@ export async function loadLedger($: EngineInterface, scope: 'session' | 'all'): 
   const raw = (await $.store.get(scope === 'all' ? ALL : sessionKey)) as Partial<Ledger> | undefined
   const e = emptyLedger()
   if (!raw) return e
-  return { ...e, ...raw, lines: raw.lines ?? {}, local: { ...e.local, ...(raw.local ?? {}) }, avoided: { ...e.avoided, ...(raw.avoided ?? {}) }, notPriced: { ...e.notPriced, ...(raw.notPriced ?? {}) } }
+  return { ...e, ...raw, lines: raw.lines ?? {}, avoided: { ...e.avoided, ...(raw.avoided ?? {}) }, notPriced: { ...e.notPriced, ...(raw.notPriced ?? {}) } }
 }
 
 export async function clearLedgers($: EngineInterface): Promise<void> {
@@ -102,15 +99,6 @@ export async function recordModelCall($: EngineInterface, who: Who, model: strin
     line.output += u.output_tokens
     line.usd += usd
     line.insteadUsd += insteadUsd
-  })
-}
-
-/** The local judge's calls and the tokens it processed (free, but counted). */
-export async function recordLocalCalls($: EngineInterface, calls: number, prompt: number, output: number): Promise<void> {
-  await updateLedger($, l => {
-    l.local.calls += calls
-    l.local.prompt += prompt
-    l.local.output += output
   })
 }
 
@@ -150,7 +138,7 @@ export async function resetAvoided($: EngineInterface): Promise<void> {
 const WHO_LABEL: Record<Who, string> = { main: 'main loop', subagent: 'subagents', routed: 'routed by Hmind', compact: 'compaction', judge: 'Hmind judge', digest: 'Hmind digest' }
 const ORDER: Who[] = ['main', 'subagent', 'routed', 'compact', 'judge', 'digest']
 
-export type LedgerExtras = { title: string; localModel: string; cliUsd?: number }
+export type LedgerExtras = { title: string; cliUsd?: number }
 
 export type LedgerSummary = { claudeUsd: number; ownUsd: number; savedUsd: number; mainModel: string; requests: number }
 
@@ -174,8 +162,7 @@ export function ledgerText(l: Ledger, x: LedgerExtras): string {
     const note = r.who === 'routed' && r.insteadUsd > 0 ? `  (≈ ${money(r.insteadUsd)} on the parent model)` : priceOf(r.model) ? '' : '  (no list price known)'
     out.push(row(WHO_LABEL[r.who], r.model, fmt(r.calls), fmt(r.input), fmt(r.cacheWrite), fmt(r.cacheRead), fmt(r.output), money(r.usd)) + note)
   }
-  if (l.local.calls > 0) out.push(row('Hmind local', x.localModel, fmt(l.local.calls), fmt(l.local.prompt), '', '', fmt(l.local.output), 'free') + '  (on this machine)')
-  if (lines.length === 0 && l.local.calls === 0) out.push('  no model calls recorded yet.')
+  if (lines.length === 0) out.push('  no model calls recorded yet.')
   out.push(row('total Claude', '', '', '', '', '', '', money(s.claudeUsd)) + (x.cliUsd !== undefined ? `  (the CLI's own ledger: ${money(x.cliUsd)})` : ''))
   const main = lines.filter(r => r.who === 'main')
   const mainIn = main.reduce((a, r) => a + r.input + r.cacheWrite + r.cacheRead, 0)

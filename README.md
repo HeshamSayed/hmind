@@ -1,6 +1,6 @@
 # Hmind
 
-**A second brain for Claude Code.** Every coding session is full of small judgment calls: is this command safe to run, does this output matter, how hard should the model think about this prompt, which model should this subagent get, is the work really done, is now a good time to compact? Hmind answers them in milliseconds, hands the hard ones to Claude, and learns which calls it can trust. The result is leaner sessions, fewer wasted tokens, safer hands on the shell, and decisions you can audit.
+**A second brain for Claude Code.** Every coding session is full of small judgment calls: is this command safe to run, does this output matter, how hard should the model think about this prompt, which model should this subagent get, is the work really done, is now a good time to compact? Hmind answers them for a few hundred tokens each, acts only when it is sure, and shows you what every model in the session consumed. The result is leaner sessions, fewer wasted tokens, safer hands on the shell, and decisions you can audit.
 
 ## Why you will feel it
 
@@ -8,8 +8,7 @@
 - **It tightens when your plan is running low.** Hmind watches your 5-hour and 7-day usage windows. As they fill, it lowers effort on more turns, trims harder, compacts sooner, routes more subagent work to cheaper models, and tells you.
 - **Safer sessions.** A shell command that could wipe data, rewrite shared history or change your system is stopped before it runs, with a reason the model can act on. Approve one and Hmind learns the rule for that project, so it never asks about that shape again.
 - **Honest status, optionally enforced.** When a turn says "done" but nothing was tested, built or run, you hear about it. Turn on auto-verify and Hmind runs the project's own test or build command itself and puts the result in front of the model.
-- **Trust that calibrates itself.** A sample of the fast tier's answers is shadow-checked against Claude, every escalation compares the two for free, and your labels count too. Trust per decision kind moves up or down from that evidence, so Hmind gets sharper the more you use it.
-- **You see where the tokens go.** Every model call is written to a ledger: the main loop, each subagent, Hmind's own judge and digest calls, and the local judge, by model, with input, cache-write, cache-read and output tokens and the list-price cost of each. `/hmind usage` prints the breakdown with a savings estimate: what the trimmed output would have cost to carry through every later request, what routed subagents cost against the model they would have run on, and what Hmind's own calls cost, netted.
+- **You see where the tokens go.** Every model call is written to a ledger: the main loop, each subagent, subagents Hmind routed cheaper, compaction, and Hmind's own judge and digest calls, by model, with input, cache-write, cache-read and output tokens and the list-price cost of each. `/hmind usage` prints the breakdown with a savings estimate: what the trimmed output would have cost to carry through every later request, what routed subagents cost against the model they would have run on, and what Hmind's own calls cost, netted.
 - **A tool for the model too.** Claude can ask Hmind its own typed questions, batched over one state, instead of reasoning at length about each item.
 
 Everything fails open: if the judge is unavailable or unsure, Claude Code behaves exactly as it did before.
@@ -19,7 +18,7 @@ Everything fails open: if the judge is unavailable or unsure, Claude Code behave
 | Where | Decision | Action |
 | --- | --- | --- |
 | Before a Bash call | Could this command destroy data or system state? | Refuse it above the `denyAt` probability, unless a learned rule allows it |
-| After a Bash call | How much of this long output will the assistant need? | Head and tail, errors only, or a Claude-written digest of the failures |
+| After a Bash call | How much of this long output will the assistant need? | Head and tail, errors only, or a judge-written digest of the failures |
 | First model request of a turn | Is the prompt trivial, a small change, or real work? | Lower the effort for that turn; lower still under budget pressure (keeps the prompt cache on Fable 5.1 and Opus 5.5) |
 | Subagent launch | Is this task a lookup, mechanical, or does it need judgment? | Route lookups to `haiku` and mechanical work to `sonnet`; warn when a full-context fork is launched for a self-contained task |
 | End of a turn | Did the answer claim "done" with no test, build or run this turn? | Toast, push the model to verify, or run the verification yourself |
@@ -32,26 +31,24 @@ Everything fails open: if the judge is unavailable or unsure, Claude Code behave
 
 Hmind asks typed questions and gets probabilities back, never prose: a **choice** among options, a **score** from 0 to 1, or a yes/no **noul** with the probability the statement is true.
 
-1. **Fast tier.** A small local model served by Ollama (`qwen2.5:1.5b-instruct` by default) answers with a single token, and the probabilities are read straight off its logprobs. Each question is asked in both option orders to cancel position bias. About 300 ms, free, private.
-2. **Deep tier.** When the fast tier is not trusted on a question, it goes to Claude (`haiku` by default) through your own Claude Code session, which reads the whole state with real understanding and returns a reason.
+Every question goes to a Claude judge model, `haiku` by default, through your own Claude Code session, batched when several questions share one state. The judge reads the whole state with real understanding and answers each question with an option, a confidence and a one-line reason. Hmind acts on an answer only above the confidence threshold (0.75 by default); below it, nothing changes. A judge call is a few hundred tokens, and the ledger shows exactly what they add up to, so the cost of the second brain is never a guess.
 
-A local answer stands only above its kind's trust; otherwise the question escalates. The starting values come from measurement, and self-calibration moves them: every ten samples of a kind, trust steps down 0.05 when the local tier agreed with Claude at least 90% of the time, and up 0.05 when it agreed under 80%. `/hmind trust` shows the live values and the evidence behind them.
+There is nothing to install beyond the plugin: no server, no local model, no GPU. Wherever Claude Code runs, Hmind runs.
 
 ## Measured (52 labeled cases, `eval/`)
 
-| Decision | qwen2.5 1.5B | qwen2.5 7B | Claude Haiku |
-| --- | --- | --- | --- |
-| gate (destructive?) | 80% (90% on the 10/20 it is sure of) | 85% | 100% |
-| effort (trivial / small / large) | 50% | 86% | 100% |
-| trim (all / head+tail / errors) | 38% | 100% | 100% |
-| done claim (asserts finished?) | 90% (100% on the 5/10 it is sure of) | 70% | 100% |
-| latency per decision | 0.3 s (trim 1.3 s) | 0.7 to 5.8 s | 0.4 to 0.8 s batched |
+| Decision | Claude Haiku |
+| --- | --- |
+| gate (destructive?) | 100% |
+| effort (trivial / small / large) | 100% |
+| trim (all / head+tail / errors) | 100% |
+| done claim (asserts finished?) | 100% |
+| latency per batch of decisions | 0.4 to 0.8 s |
 
-So the small model starts trusted on the done-claim question, trusted only when very sure (0.85) on the shell gate, where a wrong "safe" is the costly direction, and not at all on the three-way choices; those go to Claude until the calibration earns them back. A bigger local model is not a free upgrade: the 7B is overconfident when wrong. Re-run the eval before trusting any model on more kinds:
+Re-run the eval before trusting another judge model or changing a question's wording:
 
 ```sh
-node eval/local.mts qwen2.5:1.5b-instruct   # the local tier
-node eval/claude.mts haiku                   # the Claude tier, one batched claude -p call per kind
+node eval/claude.mts haiku    # one batched claude -p call per decision kind
 ```
 
 ## Install
@@ -64,30 +61,21 @@ At the prompt of a terminal Claude Code session:
 
 Answer `y` to add the marketplace, then pick a scope (user is the usual choice). From a shell: `claude plugin install hmind --marketplace HeshamSayed/hmind`. In the desktop app, click + next to the prompt box, then Plugins, Add marketplace with `HeshamSayed/hmind`, then Add plugin.
 
-## Setup
+## Platforms
 
-Hmind runs wherever Claude Code runs: macOS, Linux and Windows. The fast tier needs Ollama; without it every decision goes to Claude and everything still works.
-
-| Platform | Install Ollama |
-| --- | --- |
-| macOS | `brew install ollama`, or the app from ollama.com |
-| Linux | `curl -fsSL https://ollama.com/install.sh \| sh` (installs a systemd service) |
-| Windows | `winget install Ollama.Ollama`, or the installer from ollama.com (runs in the tray) |
-
-Hmind starts `ollama serve` itself when nothing is listening on the Ollama port, and pulls the small model on first use (about 1 GB).
+Hmind runs wherever Claude Code runs: macOS, Linux and Windows, on any machine, since the judge is a Claude model reached through your session.
 
 On Windows the shell guard understands PowerShell and `cmd` forms as well as the Git Bash ones Claude Code uses: `Remove-Item -Recurse -Force`, `rd /s /q`, `del`, `format`, `diskpart`, `Stop-Process`, `reg delete`, `Set-ExecutionPolicy`, `irm ... | iex` and friends are judged like `rm -rf` and `curl | sh`. Auto-verify spells its commands for the platform too (`python` and `gradlew.bat` on Windows, `python3` and `./gradlew` elsewhere) and recognises npm, pnpm, yarn, bun, pytest, Cargo, Go, Flutter, Mix, Gradle, Maven, .NET, Make, RSpec and PHPUnit projects.
 
-The eval scripts need Node 22.6 or newer (`node --experimental-strip-types` on 22, plain `node` on 23 and later).
+The eval script needs Node 22.6 or newer (`node --experimental-strip-types` on 22, plain `node` on 23 and later).
 
 ## Commands
 
-- `/hmind` stats: decisions per tier, latency, every action taken, calibration, trust, budget pressure, rules, and this session's spend in one line.
-- `/hmind usage` the ledger for this session: tokens and list-price cost by who and model (main loop, subagents, subagents Hmind routed cheaper, compaction, Hmind's judge and digest calls, the local judge), the prompt-cache hit rate, and the savings estimate; `/hmind usage all` across sessions. Prices are list API prices; on a subscription this is plan usage, not a bill.
-- `/hmind log` the last 15 decisions with ids; `/hmind right <id>` or `/hmind wrong <id>` to label one.
-- `/hmind trust` the live trust per kind and the shadow-check evidence; `/hmind trust reset` back to the configured start.
+- `/hmind` stats: decisions, latency, every action taken, labels, budget pressure, rules, and this session's spend in one line.
+- `/hmind usage` the ledger for this session: tokens and list-price cost by who and model (main loop, subagents, subagents Hmind routed cheaper, compaction, Hmind's judge and digest calls), the prompt-cache hit rate, and the savings estimate; `/hmind usage all` across sessions. Prices are list API prices; on a subscription this is plan usage, not a bill.
+- `/hmind log` the last 15 decisions with ids; `/hmind right <id>` or `/hmind wrong <id>` to label one and track the judge's accuracy and calibration.
 - `/hmind rules`, `/hmind allow <command>`, `/hmind forget <n>` for the project's allow rules.
 - `/hmind verify on|off` to let Hmind run the project's test or build command after an unverified done claim; `/hmind verify` shows the command it recognised.
 - `/hmind budget` the current pressure; `/hmind off`, `/hmind on`, `/hmind reset`.
 
-Settings live in the config menu under the plugin's name: thresholds, models, starting trust, shadow rate, and each feature on or off.
+Settings live in the config menu under the plugin's name: the judge model, the confidence threshold, thresholds for each action, and each feature on or off.

@@ -1,50 +1,20 @@
 {
   "name": "hmind",
-  "version": "0.3.0",
-  "description": "A second brain for Claude Code: guards risky commands, trims noisy output, right-sizes effort per prompt, catches unverified done claims and compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost. Fast local judgments, Claude when it matters, every decision logged.",
+  "version": "0.4.0",
+  "description": "A second brain for Claude Code: guards risky commands, trims noisy output, right-sizes effort per prompt, routes subagents to cheaper models, catches unverified done claims, compacts at task boundaries, and keeps a ledger of every model call with its tokens and cost. Every decision logged.",
   "license": "MIT",
   "userConfig": {
-    "ollamaUrl": {
+    "judgeModel": {
       "type": "string",
-      "title": "Ollama URL",
-      "description": "Ollama server for the fast local tier",
-      "default": "http://127.0.0.1:11434"
-    },
-    "ollamaModel": {
-      "type": "string",
-      "title": "Local model",
-      "description": "Model for the fast tier (any small instruct model Ollama serves with logprobs)",
-      "default": "qwen2.5:1.5b-instruct"
-    },
-    "escalateModel": {
-      "type": "string",
-      "title": "Escalation model",
-      "description": "Claude model alias used when the local tier is unsure (haiku, sonnet, opus)",
+      "title": "Judge model",
+      "description": "Claude model alias that answers Hmind's questions through your session (haiku, sonnet, opus)",
       "default": "haiku"
-    },
-    "escalate": {
-      "type": "boolean",
-      "title": "Escalate to Claude",
-      "description": "Send uncertain decisions to the Claude model",
-      "default": true
     },
     "confidence": {
       "type": "number",
       "title": "Confidence threshold",
-      "description": "Below this confidence (0-1) a Claude answer is not acted on",
+      "description": "Below this confidence (0-1) a judge answer is not acted on",
       "default": 0.75
-    },
-    "localTrust": {
-      "type": "string",
-      "title": "Local trust per kind (starting values)",
-      "description": "kind=threshold pairs: the local confidence at which a local answer stands without asking Claude (1 = always ask). Self-calibration moves these; /hmind trust shows the live values",
-      "default": "gate=0.85,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1"
-    },
-    "shadowRate": {
-      "type": "number",
-      "title": "Shadow check rate",
-      "description": "Share (0-1) of local answers that stood which are also checked against Claude to recalibrate trust",
-      "default": 0.15
     },
     "budgetMode": {
       "type": "boolean",
@@ -79,7 +49,7 @@
     "digest": {
       "type": "boolean",
       "title": "Digest failures",
-      "description": "When only the failures matter, have Claude write a compact digest instead of a head-and-tail cut",
+      "description": "When only the failures matter, have the judge write a compact digest instead of a head-and-tail cut",
       "default": true
     },
     "routeEffort": {

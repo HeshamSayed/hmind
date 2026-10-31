@@ -8,20 +8,17 @@
 //   5. prompt.submit: compact at a task boundary once context is full; learn allow rules from approvals.
 //   6. agent.spawn: route lookup and mechanical subagent work to cheaper models; warn on needless forks.
 //   7. every model call: a ledger of tokens and list-price cost by who made it and on which model (/hmind usage).
-// Plus a `decide` tool the model can call itself, `/hmind` for stats and control, and a trust in the
-// local judge that recalibrates itself from shadow checks against Claude.
-// Every hook fails open: when the judge is down or unsure, nothing changes.
+// Plus a `decide` tool the model can call itself, and `/hmind` for stats, usage and control.
+// Every hook fails open: when the judge is unavailable or unsure, nothing changes.
 
 import type { Register, EngineInterface } from 'claude-code'
 
-import { describeTrust, loadTrust, recordSample, resetTrust, SAMPLE_BAR } from './calibration'
-import type { TrustState } from './calibration'
 import { compactAtFor, describePressure, effortFor, readPressure, trimOverFor } from './budget'
 import type { Effort, Pressure, Size } from './budget'
 import { digest } from './digest'
 import { clearLedgers, ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest, resetAvoided, setLedgerSession, summarize, updateLedger } from './ledger'
 import { money } from './pricing'
-import { agrees, bumpStats, calibration, clamp, decide, decideClaude, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
+import { bumpStats, calibration, clamp, decide, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
 import type { Answer, DecisionRecord, JudgeConfig, Question } from './judge'
 import {
   approvalQuestion,
@@ -69,7 +66,6 @@ type Options = {
   routeEffort: boolean
   doneCheck: string
   compactAt: number
-  shadowRate: number
   budgetMode: boolean
   subagents: boolean
   digest: boolean
@@ -82,12 +78,10 @@ type Shared = {
   cfg: JudgeConfig
   opt: Options
   enabled: boolean
-  localUp: boolean
   wantsCompact: boolean
   mainTurn: string | undefined
   turns: Map<string, TurnState>
   pendingTrims: PendingTrim[]
-  trust: TrustState
   rules: Rule[]
   pressure: Pressure
   root: string
@@ -104,24 +98,8 @@ const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slic
 const normalize = (command: string) => command.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, 160)
 const pct = (p: number) => `${Math.round(p * 100)}%`
 
-/** "gate=0.75,effort=1" -> { gate: 0.75, effort: 1 }; unknown kinds fall back to the global threshold. */
-function parseTrust(raw: unknown, fallback: number): Record<string, number> {
-  const out: Record<string, number> = {}
-  for (const pair of String(raw ?? '').split(',')) {
-    const [kind, value] = pair.split('=').map(s => s.trim())
-    if (kind && value !== undefined && Number.isFinite(Number(value))) out[kind] = clamp(Number(value), 0.5, 1)
-  }
-  out.default = fallback
-  return out
-}
-
-const trustFor = (sh: Shared, kind: string): number => sh.trust.trust[kind] ?? sh.trust.trust.default ?? sh.cfg.confidence
-
-/** A local answer stands only above its kind's trust; a Claude answer above the global threshold. */
-function usable(a: Answer, kind: string, sh: Shared): boolean {
-  if (a.tier === 'none') return false
-  return a.confidence >= (a.tier === 'local' ? trustFor(sh, kind) : sh.cfg.confidence)
-}
+/** A judge answer is usable for an automatic action above the confidence threshold. */
+const usable = (a: Answer, sh: Shared): boolean => a.tier !== 'none' && a.confidence >= sh.cfg.confidence
 
 function headTail(out: string, head = 2500, tail = 2500): string {
   return `${out.slice(0, head)}\n…\n${out.slice(-tail)}`
@@ -136,81 +114,15 @@ function errorsOnly(out: string): string {
 
 const rankOf = (model: string): number => (/haiku/i.test(model) ? 0 : /sonnet/i.test(model) ? 1 : /opus/i.test(model) ? 2 : /fable|mythos/i.test(model) ? 3 : 2)
 
-// ------------------------------------------------------------ logging and calibration
+// ------------------------------------------------------------ logging
 
-type ShadowSource = { state: string; question: Question }
-
-/** Record a batch of answers; feed the calibration with what the escalation already showed, and shadow-check a sample of the local answers that stood. */
-async function log($: EngineInterface, sh: Shared, kind: string, summary: string, answers: Answer[], source?: ShadowSource): Promise<string> {
+/** Record a batch of answers for the stats and the decision log. */
+async function log($: EngineInterface, kind: string, summary: string, answers: Answer[]): Promise<string> {
   const id = newId()
   const rec: DecisionRecord = { id, at: new Date().toISOString(), kind, summary: summary.slice(0, 160), answers }
-  await recordAnswers($, answers, sh.localUp)
+  await recordAnswers($, answers)
   await remember($, rec)
-  for (const a of answers) {
-    if (a.tier === 'claude' && a.shadow?.tier === 'local' && a.shadow.confidence >= SAMPLE_BAR) {
-      await noteSample($, sh, kind, agrees(a.shadow, a))
-    } else if (a.tier === 'local' && source && sh.cfg.escalate && Math.random() < sh.opt.shadowRate) {
-      void shadowCheck($, sh, kind, source, a).catch(() => undefined)
-    }
-  }
   return id
-}
-
-async function noteSample($: EngineInterface, sh: Shared, kind: string, agreed: boolean): Promise<void> {
-  const changed = await recordSample($, sh.trust, kind, agreed)
-  if (changed) $.ui.toast(`Hmind: trust in the local judge for ${kind} ${changed.from} → ${changed.to}`)
-}
-
-async function shadowCheck($: EngineInterface, sh: Shared, kind: string, source: ShadowSource, local: Answer): Promise<void> {
-  const [c] = await decideClaude($, sh.cfg, source.state, [source.question])
-  if (!c || c.tier === 'none') return
-  const ok = agrees(local, c)
-  await noteSample($, sh, kind, ok)
-  if (!ok && kind === 'gate' && (c.p ?? 0) >= sh.opt.denyAt) $.ui.toast('Hmind: a shadow check disagreed with a shell gate; Claude would have refused it')
-}
-
-// ------------------------------------------------------------ local tier
-
-async function ping($: EngineInterface, cfg: JudgeConfig, ms: number): Promise<boolean> {
-  const r = await Promise.race([$.http.fetch(`${cfg.ollamaUrl}/api/version`).catch(() => undefined), $.clock.sleep(ms).then(() => undefined)])
-  return !!r && r.ok
-}
-
-/** Make sure the local tier is reachable and has its model; otherwise the Claude tier carries every decision. */
-async function ensureLocal($: EngineInterface, sh: Shared): Promise<void> {
-  const { cfg } = sh
-  sh.localUp = await ping($, cfg, 1500)
-  if (!sh.localUp) {
-    void (async () => {
-      try {
-        for await (const _chunk of $.process.spawn({ argv: ['ollama', 'serve'] })) {
-          /* output ignored */
-        }
-      } catch {
-        /* ollama not installed */
-      }
-    })()
-    for (let i = 0; i < 12 && !sh.localUp; i += 1) {
-      await $.clock.sleep(500)
-      sh.localUp = await ping($, cfg, 800)
-    }
-  }
-  if (!sh.localUp) {
-    $.ui.status(cfg.escalate ? `Hmind: local judge down, ${cfg.escalateModel} only` : 'Hmind: judge down, idle')
-    return
-  }
-  const tags = await $.http.fetch(`${cfg.ollamaUrl}/api/tags`).catch(() => undefined)
-  const hasModel = !!tags && tags.ok && tags.text.includes(`"${cfg.ollamaModel}"`)
-  if (!hasModel) {
-    $.ui.toast(`Hmind: pulling ${cfg.ollamaModel} for the local judge`)
-    const pulled = await $.process.run(['ollama', 'pull', cfg.ollamaModel], { timeoutMs: 600000 }).catch(() => undefined)
-    if (!pulled || pulled.exitCode !== 0) {
-      sh.localUp = false
-      $.ui.status(`Hmind: could not pull ${cfg.ollamaModel}; ${cfg.escalateModel} only`)
-      return
-    }
-  }
-  $.ui.status(`Hmind: ${cfg.ollamaModel} ready${cfg.escalate ? `, escalates to ${cfg.escalateModel}` : ''}`)
 }
 
 // ------------------------------------------------------------ surface
@@ -218,14 +130,14 @@ async function ensureLocal($: EngineInterface, sh: Shared): Promise<void> {
 async function registerSurface($: EngineInterface): Promise<void> {
   await $.command.register({
     name: 'hmind',
-    description: 'Hmind: stats, usage and cost by model, decisions, trust, rules, verify, on/off',
-    argumentHint: '[usage [all]|log|trust|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
+    description: 'Hmind: stats, usage and cost by model, decisions, rules, verify, on/off',
+    argumentHint: '[usage [all]|log|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
   })
   await $.tool.register({
     name: 'decide',
     description:
       'Typed decisions over a state: choice (pick one option), score (0..1 on a rubric) and noul (is a statement true?). ' +
-      'Each answer carries probabilities, a confidence (0..1) and the tier that served it (a fast local judge, or Claude when it was unsure). ' +
+      'Each answer carries probabilities, a confidence (0..1) and a short reason. ' +
       'Use it to classify, rank, route, gate or triage many items cheaply instead of reasoning about each at length. Batch several questions over one state.',
     inputSchema: {
       type: 'object',
@@ -280,20 +192,18 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
   const s = await loadStats($)
   const c = await calibration($)
   const { cfg } = sh
-  const avg = (ms: number, n: number) => (n ? `${Math.round(ms / n)} ms` : 'n/a')
+  const answered = s.decisions - s.unanswered
   const verifyOn = sh.opt.autoVerify || (await $.store.get(`verify:${sh.root}`)) === true
   const u = summarize(await loadLedger($, 'session'))
   return [
-    `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions (local ${s.byTier.local}, claude ${s.byTier.claude}, unanswered ${s.byTier.none}), ${s.escalations} escalations`,
-    `  latency: local avg ${avg(s.localMs, s.byTier.local)}, claude avg ${avg(s.claudeMs, s.byTier.claude)}`,
+    `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions by ${cfg.judgeModel} (${s.unanswered} unanswered), avg ${answered ? `${Math.round(s.claudeMs / answered)} ms` : 'n/a'} each`,
     `  actions: effort lowered on ${s.effortLowered} turns, ${s.trims} output trims saving ${Math.round(s.trimmedChars / 1000)}K chars (${s.digests} digests, ${s.trimRegrets} regretted), ${s.denies} shell refusals (${s.rulesApplied} allowed by rule), ${s.unverifiedClaims} unverified done claims, ${s.verifications} verification runs (${s.verificationsFailed} failed), ${s.compactions} boundary compactions, ${s.subagentsRouted} subagents routed cheaper, ${s.forkWarnings} fork warnings`,
-    `  calibration: ${sh.trust.checks} shadow checks, ${sh.trust.checks ? pct(sh.trust.agreements / sh.trust.checks) : 'n/a'} agreement; ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
-    `  trust in the local judge: ${describeTrust(sh.trust)}`,
+    `  labels: ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
     `  budget: ${sh.opt.budgetMode ? describePressure(sh.pressure) || `normal (${sh.pressure.percent}% of the ${sh.pressure.window} window)` : 'budget mode off'}`,
     `  usage this session: Claude ${money(u.claudeUsd)}${u.mainModel ? ` (${u.mainModel}, ${u.requests} requests)` : ''}, Hmind's own calls ${money(u.ownUsd)}, est. ${money(u.savedUsd)} saved at list prices; /hmind usage for the breakdown by model`,
     `  rules: ${sh.rules.filter(r => r.root === sh.root).length} learned for this project; auto-verify ${verifyOn ? 'on' : 'off'} here`,
-    `  tiers: ${cfg.ollamaModel} at ${cfg.ollamaUrl} (${sh.localUp ? 'up' : 'down'}), escalation ${cfg.escalate ? cfg.escalateModel : 'off'}, confidence threshold ${cfg.confidence}, shadow rate ${sh.opt.shadowRate}`,
-    '  /hmind usage [all] | log | trust [reset] | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
+    `  judge: ${cfg.judgeModel}, confidence threshold ${cfg.confidence}`,
+    '  /hmind usage [all] | log | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
   ].join('\n')
 }
 
@@ -352,7 +262,6 @@ export const register: Register = (on, options) => {
       routeEffort: options.routeEffort !== false,
       doneCheck: String(options.doneCheck ?? 'toast'),
       compactAt: Math.max(0, Number(options.compactAt ?? 55)),
-      shadowRate: clamp(Number(options.shadowRate ?? 0.15), 0, 1),
       budgetMode: options.budgetMode !== false,
       subagents: options.subagents !== false,
       digest: options.digest !== false,
@@ -360,12 +269,10 @@ export const register: Register = (on, options) => {
       learnRules: options.learnRules !== false,
     },
     enabled: true,
-    localUp: false,
     wantsCompact: false,
     mainTurn: undefined,
     turns: new Map(),
     pendingTrims: [],
-    trust: { trust: parseTrust(options.localTrust ?? 'gate=0.85,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85,spawn=0.85,fork=0.85,approval=1', cfg.confidence), samples: {}, adjustments: [], checks: 0, agreements: 0 },
     rules: [],
     pressure: { level: 'normal', percent: 0, window: 'none' },
     root: '',
@@ -375,7 +282,6 @@ export const register: Register = (on, options) => {
     mainModel: '',
   }
   const { opt } = sh
-  const defaults = { ...sh.trust.trust }
   let lastLevel = 'normal'
 
   // ------------------------------------------------------------ session
@@ -383,12 +289,10 @@ export const register: Register = (on, options) => {
   on('session.start', async ($, e, next) => {
     sh.enabled = (await loadStats($)).enabled
     sh.root = await $.session.root().catch(() => e.cwd)
-    sh.trust = await loadTrust($, defaults)
     sh.rules = await loadRules($)
     const usage = await $.session.usage().catch(() => undefined)
     setLedgerSession(String(usage?.startedAt ?? Date.now()))
     await registerSurface($)
-    void ensureLocal($, sh).catch(() => undefined)
     if (opt.budgetMode) void readPressure($).then(p => (sh.pressure = p)).catch(() => undefined)
     return next(e)
   })
@@ -403,7 +307,7 @@ export const register: Register = (on, options) => {
           scope: 'session',
           text:
             'A `decide` tool (mcp__hmind__decide) answers typed questions about a state you give it: choice, score or yes/no, each with probabilities and a confidence, ' +
-            'served by a fast local judge and escalated to Claude when unsure. Reach for it when you must classify, rank, route, gate or triage many items, or check a claim quickly, instead of reasoning about each at length.',
+            'served by a Claude judge model. Reach for it when you must classify, rank, route, gate or triage many items, or check a claim quickly, instead of reasoning about each at length.',
         },
       ],
     }
@@ -439,9 +343,9 @@ export const register: Register = (on, options) => {
           const text = sh.turns.get(e.turnId)?.prompt ?? ''
           if (text.length >= 8 && text.length <= 6000 && !text.startsWith('/')) {
             const state = sizeState(text)
-            const a = await decideOne($, cfg, state, [sizeQuestion], { threshold: trustFor(sh, 'effort') })
-            await log($, sh, 'effort', text, [a], { state, question: sizeQuestion })
-            if (usable(a, 'effort', sh) && a.choice) {
+            const a = await decideOne($, cfg, state, [sizeQuestion])
+            await log($, 'effort', text, [a])
+            if (usable(a, sh) && a.choice) {
               const size: Size = a.choice.startsWith('a question') ? 'trivial' : a.choice.startsWith('a small') ? 'small' : 'large'
               effort = effortFor(opt.budgetMode ? sh.pressure.level : 'normal', size, e.effort as Effort)
             }
@@ -501,9 +405,9 @@ export const register: Register = (on, options) => {
       } else {
         const cwd = await $.session.cwd()
         const state = gateState(cwd, e.command)
-        const a = await decideOne($, cfg, state, [gateQuestion], { threshold: trustFor(sh, 'gate') })
-        await log($, sh, 'gate', e.command, [a], { state, question: gateQuestion })
-        if (usable(a, 'gate', sh) && a.p !== undefined && a.p >= opt.denyAt) {
+        const a = await decideOne($, cfg, state, [gateQuestion])
+        await log($, 'gate', e.command, [a])
+        if (usable(a, sh) && a.p !== undefined && a.p >= opt.denyAt) {
           await bumpStats($, s => {
             s.denies += 1
           })
@@ -534,9 +438,9 @@ export const register: Register = (on, options) => {
     ) {
       const out = ran.result.stdout
       const state = needState(e.command, out)
-      const a = await decideOne($, cfg, state, [needQuestion], { threshold: trustFor(sh, 'trim') })
-      const id = await log($, sh, 'trim', e.command, [a], { state, question: needQuestion })
-      if (usable(a, 'trim', sh) && a.choice && !a.choice.startsWith('all')) {
+      const a = await decideOne($, cfg, state, [needQuestion])
+      const id = await log($, 'trim', e.command, [a])
+      if (usable(a, sh) && a.choice && !a.choice.startsWith('all')) {
         let kept: string | undefined
         let how = a.choice.split(':')[0] ?? 'trimmed'
         if (a.choice.startsWith('only') && opt.digest && out.length > 8000) {
@@ -572,9 +476,9 @@ export const register: Register = (on, options) => {
     if (!sh.enabled || !opt.subagents || e.parentAgentId !== undefined) return next(e)
     if (e.subagentType === 'fork') {
       const state = spawnState(e.subagentType, e.description, e.prompt)
-      const a = await decideOne($, cfg, state, [forkQuestion], { threshold: trustFor(sh, 'fork') })
-      await log($, sh, 'fork', e.description, [a], { state, question: forkQuestion })
-      if (usable(a, 'fork', sh) && a.p !== undefined && a.p <= 1 - cfg.confidence) {
+      const a = await decideOne($, cfg, state, [forkQuestion])
+      await log($, 'fork', e.description, [a])
+      if (usable(a, sh) && a.p !== undefined && a.p <= 1 - cfg.confidence) {
         await bumpStats($, s => {
           s.forkWarnings += 1
         })
@@ -584,9 +488,9 @@ export const register: Register = (on, options) => {
     }
     if (e.model !== undefined) return next(e)
     const state = spawnState(e.subagentType, e.description, e.prompt)
-    const a = await decideOne($, cfg, state, [spawnQuestion], { threshold: trustFor(sh, 'spawn') })
-    await log($, sh, 'spawn', e.description, [a], { state, question: spawnQuestion })
-    if (!usable(a, 'spawn', sh) || !a.choice) return next(e)
+    const a = await decideOne($, cfg, state, [spawnQuestion])
+    await log($, 'spawn', e.description, [a])
+    if (!usable(a, sh) || !a.choice) return next(e)
     const tight = opt.budgetMode && (sh.pressure.level === 'high' || sh.pressure.level === 'critical')
     const target = a.choice.startsWith('a lookup') ? 'haiku' : a.choice.startsWith('mechanical') || tight ? 'sonnet' : undefined
     if (!target || rankOf(target) >= rankOf(e.parentModel)) return next(e)
@@ -627,9 +531,9 @@ export const register: Register = (on, options) => {
 
     if (opt.doneCheck !== 'off' && e.reason === 'answer' && t && t.edits > 0 && t.verifications === 0 && done.text.length > 40) {
       const state = claimsState(t.edits, done.text)
-      const a = await decideOne($, cfg, state, [claimsQuestion], { threshold: trustFor(sh, 'done') })
-      await log($, sh, 'done-check', done.text, [a], { state, question: claimsQuestion })
-      if (usable(a, 'done', sh) && a.p !== undefined && a.p >= cfg.confidence) {
+      const a = await decideOne($, cfg, state, [claimsQuestion])
+      await log($, 'done-check', done.text, [a])
+      if (usable(a, sh) && a.p !== undefined && a.p >= cfg.confidence) {
         await bumpStats($, s => {
           s.unverifiedClaims += 1
         })
@@ -656,9 +560,9 @@ export const register: Register = (on, options) => {
       const turn = await $.session.turns().catch(() => 0)
       if (turn - sh.lastDeny.turn <= 2) {
         const state = approvalState(sh.lastDeny.command, e.text)
-        const a = await decideOne($, cfg, state, [approvalQuestion], { threshold: trustFor(sh, 'approval') })
-        await log($, sh, 'approval', e.text, [a], { state, question: approvalQuestion })
-        if (usable(a, 'approval', sh) && a.p !== undefined && a.p >= 0.8) {
+        const a = await decideOne($, cfg, state, [approvalQuestion])
+        await log($, 'approval', e.text, [a])
+        if (usable(a, sh) && a.p !== undefined && a.p >= 0.8) {
           sh.rules = await addRule($, sh.rules, { template: templateOf(sh.lastDeny.command), root: sh.root, at: new Date().toISOString(), via: 'approval', example: sh.lastDeny.command.slice(0, 200) })
           await bumpStats($, s => {
             s.rulesLearned += 1
@@ -673,9 +577,9 @@ export const register: Register = (on, options) => {
       const msgs = await $.session.messages()
       const lastAssistant = [...msgs].reverse().find(m => m.role === 'assistant')?.text ?? ''
       const state = boundaryState(lastAssistant, e.text)
-      const a = await decideOne($, cfg, state, [boundaryQuestion], { threshold: trustFor(sh, 'boundary') })
-      await log($, sh, 'boundary', e.text, [a], { state, question: boundaryQuestion })
-      if (usable(a, 'boundary', sh) && a.p !== undefined && a.p >= cfg.confidence) {
+      const a = await decideOne($, cfg, state, [boundaryQuestion])
+      await log($, 'boundary', e.text, [a])
+      if (usable(a, sh) && a.p !== undefined && a.p >= cfg.confidence) {
         const r = await $.session.compact({ instructions: KEEP_RULES })
         if (!('skip' in r)) {
           sh.wantsCompact = false
@@ -710,8 +614,8 @@ export const register: Register = (on, options) => {
     if (typeof input.state !== 'string') return { result: 'error: decide needs a string `state`.' }
     const questions = parseQuestions(input.questions)
     if (typeof questions === 'string') return { result: `error: ${questions}` }
-    const answers = await decide($, cfg, input.state, questions, { threshold: trustFor(sh, 'tool') })
-    await log($, sh, 'tool', `${questions.length} question(s)`, answers)
+    const answers = await decide($, cfg, input.state, questions)
+    await log($, 'tool', `${questions.length} question(s)`, answers)
     return { result: formatAnswers(answers) }
   })
 
@@ -738,24 +642,13 @@ export const register: Register = (on, options) => {
       const all = rest === 'all'
       const led = await loadLedger($, all ? 'all' : 'session')
       const cli = all ? undefined : (await $.session.usage().catch(() => undefined))?.cost?.usd
-      return { text: ledgerText(led, { title: all ? 'Hmind usage, all sessions' : 'Hmind usage, this session', localModel: cfg.ollamaModel, cliUsd: cli }) }
+      return { text: ledgerText(led, { title: all ? 'Hmind usage, all sessions' : 'Hmind usage, this session', cliUsd: cli }) }
     }
     if ((verb === 'right' || verb === 'wrong') && rest) {
       const ok = await markOutcome($, rest, verb)
-      const recent = ((await $.store.get('recent')) as DecisionRecord[] | undefined) ?? []
-      const rec = recent.find(r => r.id === rest)
-      if (ok && rec?.answers[0]?.tier === 'local') await noteSample($, sh, rec.kind, verb === 'right')
       return { text: ok ? `decision ${rest} marked ${verb}.` : `no decision ${rest} in the log.` }
     }
     if (verb === 'log') return { text: await logText($) }
-    if (verb === 'trust') {
-      if (rest === 'reset') {
-        await resetTrust($)
-        sh.trust = await loadTrust($, defaults)
-        return { text: `trust reset to the configured defaults: ${describeTrust(sh.trust)}` }
-      }
-      return { text: `trust in the local judge: ${describeTrust(sh.trust)}\n${sh.trust.checks} shadow checks, ${sh.trust.checks ? pct(sh.trust.agreements / sh.trust.checks) : 'n/a'} agreement; a kind moves 0.05 every 10 samples (down at 90%+ agreement, up under 80%).` }
-    }
     if (verb === 'rules') {
       const mine = sh.rules.map((r, i) => ({ r, i })).filter(({ r }) => r.root === sh.root)
       if (mine.length === 0) return { text: 'no learned rules for this project. Add one with /hmind allow <command>.' }
