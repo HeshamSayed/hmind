@@ -1,0 +1,13 @@
+{
+  "name": "hmind",
+  "owner": {
+    "name": "HeshamSayed"
+  },
+  "plugins": [
+    {
+      "name": "hmind",
+      "source": "./"
+    }
+  ],
+  "description": "Hmind: a second brain for Claude Code"
+}

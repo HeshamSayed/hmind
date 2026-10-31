@@ -1,0 +1,85 @@
+{
+  "name": "hmind",
+  "version": "0.1.0",
+  "description": "A second brain for Claude Code: guards risky commands, trims noisy output, right-sizes effort per prompt, catches unverified done claims and compacts at task boundaries. Fast local judgments, Claude when it matters, every decision logged.",
+  "license": "MIT",
+  "userConfig": {
+    "ollamaUrl": {
+      "type": "string",
+      "title": "Ollama URL",
+      "description": "Ollama server for the fast local tier",
+      "default": "http://127.0.0.1:11434"
+    },
+    "ollamaModel": {
+      "type": "string",
+      "title": "Local model",
+      "description": "Model for the fast tier (any small instruct model Ollama serves with logprobs)",
+      "default": "qwen2.5:1.5b-instruct"
+    },
+    "escalateModel": {
+      "type": "string",
+      "title": "Escalation model",
+      "description": "Claude model alias used when the local tier is unsure (haiku, sonnet, opus)",
+      "default": "haiku"
+    },
+    "escalate": {
+      "type": "boolean",
+      "title": "Escalate to Claude",
+      "description": "Send uncertain decisions to the Claude model",
+      "default": true
+    },
+    "confidence": {
+      "type": "number",
+      "title": "Confidence threshold",
+      "description": "Below this local confidence (0-1) a decision escalates; below it after escalation the mod does nothing",
+      "default": 0.75
+    },
+    "bashGuard": {
+      "type": "boolean",
+      "title": "Shell guard",
+      "description": "Refuse shell commands judged likely destructive",
+      "default": true
+    },
+    "denyAt": {
+      "type": "number",
+      "title": "Refuse at",
+      "description": "Probability (0-1) of destruction at which a shell command is refused",
+      "default": 0.85
+    },
+    "trimOver": {
+      "type": "number",
+      "title": "Trim output over",
+      "description": "Bash output longer than this many characters is judged for trimming (0 disables)",
+      "default": 6000
+    },
+    "routeEffort": {
+      "type": "boolean",
+      "title": "Route effort",
+      "description": "Lower the model's effort for trivial prompts and small changes",
+      "default": true
+    },
+    "doneCheck": {
+      "type": "string",
+      "title": "Done check",
+      "description": "What to do when a turn claims completion without running any test, build or check",
+      "options": [
+        "off",
+        "toast",
+        "prompt"
+      ],
+      "default": "toast"
+    },
+    "localTrust": {
+      "type": "string",
+      "title": "Local trust per kind",
+      "description": "kind=threshold pairs: the local confidence at which a local answer stands without asking Claude (1 = always ask Claude). Kinds: gate, trim, effort, done, boundary, tool",
+      "default": "gate=0.75,done=0.75,boundary=0.8,effort=1,trim=1,tool=0.85"
+    },
+    "compactAt": {
+      "type": "number",
+      "title": "Compact at %",
+      "description": "Context fill percentage after which the next task boundary triggers a compaction (0 disables)",
+      "default": 55
+    }
+  }
+}

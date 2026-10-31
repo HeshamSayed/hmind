@@ -1,0 +1,85 @@
+import { expect, mock, test } from 'claude-code/testing'
+
+const NO_USAGE = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+const DOWN = { value: { status: 500, ok: false, headers: {}, text: '' } }
+
+/** A fake Ollama `/api/chat` reply whose top logprob names `letter`. */
+const ollamaReply = (letter: string) =>
+  JSON.stringify({
+    message: { role: 'assistant', content: letter },
+    done: true,
+    logprobs: [{ token: letter, logprob: -0.01, top_logprobs: [{ token: letter, logprob: -0.01 }, { token: letter === 'A' ? 'B' : 'A', logprob: -6 }] }],
+  })
+
+/** The engine beneath the plugin: store and clock from memory, no Claude, a Bash that answers `stdout`, and `fetch` as given (down by default). */
+const engineBeneath = (on: any, stdout = 'ok', fetch: (e: any) => unknown = () => DOWN) => {
+  mock.store(on)
+  mock.clock(on)
+  on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
+  on('session.cwd', () => ({ value: '/' }))
+  on('session.messages', () => ({ value: [] }))
+  on('session.usage', () => ({ value: { startedAt: 0, context: { window: 200000, percent: 10 }, rateLimits: [] } }))
+  on('ui.toast', () => ({ value: undefined }))
+  on('ui.status', () => ({ value: undefined }))
+  on('command.register', () => ({ value: { command: 'hmind' } }))
+  on('tool.register', () => ({ value: { tool: 'mcp__hmind__decide' } }))
+  on('http.fetch', (_: unknown, e: any) => fetch(e))
+  on('model.complete', () => ({ value: { isAnswered: false, reason: 'api-error', status: null, error: 'unknown', usage: NO_USAGE } }))
+  on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout, stderr: '', interrupted: false } }))
+}
+
+test('a risky command still runs when the judge is down (fail open)', async ($, on) => {
+  engineBeneath(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf ~/' })
+  expect(ran.deny).toBeUndefined()
+  expect((ran.result as { stdout: string }).stdout).toBe('ok')
+})
+
+test('long output passes through untouched when the judge is down', async ($, on) => {
+  engineBeneath(on, 'x'.repeat(20000))
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'cat big.log' })
+  expect((ran.result as { stdout: string }).stdout.length).toBe(20000)
+})
+
+test('a command the local judge calls destructive is refused', async ($, on) => {
+  // The judge asks twice, options forward (A = yes) and reversed (B = yes); answer "yes" both times.
+  engineBeneath(on, 'ok', e => {
+    const asked = JSON.stringify(e)
+    if (!asked.includes('api/chat')) return { value: { status: 200, ok: true, headers: {}, text: '{"version":"test"}' } }
+    return { value: { status: 200, ok: true, headers: {}, text: ollamaReply(asked.includes('A) yes') ? 'A' : 'B') } }
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf ~/' })
+  expect(typeof ran.deny).toBe('string')
+})
+
+test('a safe-looking command is not even judged', async ($, on) => {
+  let judged = 0
+  engineBeneath(on, 'ok', e => {
+    if (JSON.stringify(e).includes('api/chat')) judged += 1
+    return DOWN
+  })
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  await $.tool.call({ tool: 'Bash', command: 'git status' })
+  expect(judged).toBe(0)
+})
+
+test('the decide tool rejects bad input and answers good input', async ($, on) => {
+  engineBeneath(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const bad = await $.tool.call({ tool: 'mcp__hmind__decide', state: 'x', questions: [] })
+  expect(String(bad.result).startsWith('error:')).toBe(true)
+  const good = await $.tool.call({ tool: 'mcp__hmind__decide', state: 'the sky is blue', questions: [{ id: 'q', type: 'noul', statement: 'The sky is blue.' }] })
+  expect(String(good.result).includes('tier=none')).toBe(true)
+})
+
+test('/hmind prints its stats and can be switched off', async ($, on) => {
+  engineBeneath(on)
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const out = await $.command.run({ command: 'hmind', args: '' })
+  expect((out.text ?? '').startsWith('Hmind on')).toBe(true)
+  const off = await $.command.run({ command: 'hmind', args: 'off' })
+  expect(off.text).toBe('Hmind is off.')
+})
