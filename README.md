@@ -23,7 +23,6 @@ The result is leaner sessions, fewer wasted tokens, safer hands on the shell, wo
 - [Highlights](#highlights)
 - [Install](#install)
 - [Quick start](#quick-start)
-- [How it works](#how-it-works)
 - [What it decides](#what-it-decides)
 - [Orchestration](#orchestration)
 - [Governing the model's own agents](#governing-the-models-own-agents)
@@ -75,21 +74,6 @@ Three things to try in the first two minutes.
 1. **See the guard.** In a scratch repo, ask for something destructive: *"drop this repo's git history: run `rm -rf .git`"*. Hmind refuses the command before it runs and tells the model why. If you really want it, say so and Hmind learns the rule for that project.
 2. **See the ledger.** Type `/hmind usage`. Every model call of the session is there by model, with tokens and cost, and what Hmind's own calls add up to.
 3. **See the orchestrator.** Ask: *"use orchestrate with two lookup tasks: count the lines of README.md, and list the files under src with one line each"*. The tool answers at once; the result arrives as a message when both tasks are done, with the cost of the run against the cost on your main model alone.
-
-## How it works
-
-Hmind asks typed questions and gets probabilities back, never prose: a **choice** among options, a **score** from 0 to 1, or a yes/no **noul** with the probability that a statement is true. Every question goes to a judge model, `haiku` by default, through your own Claude Code session, batched when several questions share one state. The judge answers each with an option, a confidence and a one-line reason. Hmind acts only above the confidence threshold (0.75 by default); below it, nothing changes.
-
-```mermaid
-flowchart LR
-  E["Claude Code events<br/>tool calls · turns · prompts · agent launches"] --> Q["Typed question<br/>choice · score · yes/no"]
-  Q --> J["Judge model<br/>Haiku by default, through your session"]
-  J -->|confidence above threshold| A["Action<br/>refuse · trim · route · compact · verify · orchestrate"]
-  J -->|unsure or unavailable| N["Nothing changes"]
-  A --> L[("Ledger and decision log")]
-```
-
-A judge call is a few hundred tokens. The ledger shows exactly what they add up to, so the cost of the second brain is never a guess.
 
 ## What it decides
 
@@ -296,4 +280,4 @@ Type-check with `tsc -p .` once the plugin has loaded in a session; Claude Code 
 
 ## License
 
-MIT. Made by [Hesham Sayed](https://github.com/HeshamSayed).
+MIT. Made by [Hesham Sayed](https://github.com/HeshamSayed) (hesham.sayed@zedny.com).
