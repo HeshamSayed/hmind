@@ -14,6 +14,8 @@
 
 import type { EngineInterface } from 'claude-code'
 
+import { recordLocalCalls, recordModelCall } from './ledger'
+
 export type Question =
   | { id: string; type: 'noul'; statement: string }
   | { id: string; type: 'choice'; question: string; options: readonly string[] }
@@ -104,6 +106,7 @@ const round = (n: number) => Math.round(n * 1000) / 1000
 // ---------------------------------------------------------------- tier 1
 
 type LogprobEntry = { token: string; logprob: number }
+type LocalReply = { byLetter: Map<string, number>; prompt: number; output: number }
 
 /** Models Ollama refused `think: false` for (they take no thinking switch); asked once per model. */
 const noThinkSwitch = new Set<string>()
@@ -114,7 +117,7 @@ async function localLogprobs(
   state: string,
   q: Question,
   options: readonly string[],
-): Promise<Map<string, number> | undefined> {
+): Promise<LocalReply | undefined> {
   const lines = options.map((o, i) => `${LETTERS[i]}) ${o}`).join('\n')
   const messages = [
     {
@@ -150,7 +153,7 @@ async function localLogprobs(
     res = await call(false)
   }
   if (!res || !res.ok) return undefined
-  const data = JSON.parse(res.text) as { logprobs?: { top_logprobs?: LogprobEntry[] }[] }
+  const data = JSON.parse(res.text) as { logprobs?: { top_logprobs?: LogprobEntry[] }[]; prompt_eval_count?: number; eval_count?: number }
   const top = data.logprobs?.[0]?.top_logprobs
   if (!top || top.length === 0) return undefined
   const byLetter = new Map<string, number>()
@@ -161,7 +164,7 @@ async function localLogprobs(
     if (i < 0 || i >= options.length) continue
     byLetter.set(letter, Math.max(byLetter.get(letter) ?? -Infinity, logprob))
   }
-  return byLetter.size === 0 ? undefined : byLetter
+  return byLetter.size === 0 ? undefined : { byLetter, prompt: data.prompt_eval_count ?? 0, output: data.eval_count ?? 0 }
 }
 
 /** Ask once per ordering (forward and reversed) and average the probabilities. */
@@ -174,15 +177,16 @@ async function localAnswer($: EngineInterface, cfg: JudgeConfig, state: string, 
     options.length <= 6 ? localLogprobs($, cfg, state, q, reversed) : Promise.resolve(undefined),
   ])
   if (!fwd) return undefined
+  await recordLocalCalls($, rev ? 2 : 1, fwd.prompt + (rev?.prompt ?? 0), fwd.output + (rev?.output ?? 0)).catch(() => undefined)
   const toProbs = (m: Map<string, number>, order: readonly string[]): number[] => {
     const seen = [...m.values()]
     const floor = Math.min(...seen) - 4
     const logits = order.map((_, i) => m.get(LETTERS[i] ?? '') ?? floor)
     return softmax(logits, cfg.temperature[q.type])
   }
-  let probs = toProbs(fwd, options)
+  let probs = toProbs(fwd.byLetter, options)
   if (rev) {
-    const revProbs = toProbs(rev, reversed).reverse()
+    const revProbs = toProbs(rev.byLetter, reversed).reverse()
     probs = probs.map((p, i) => (p + (revProbs[i] ?? p)) / 2)
   }
   const ms = (await $.clock.now()) - started
@@ -205,6 +209,7 @@ async function claudeAnswers($: EngineInterface, cfg: JudgeConfig, state: string
     'confidence is the probability that your answer is right. No prose, no markdown, nothing but the JSON lines.'
   const prompt = `STATE:\n${state}\n\nQUESTIONS:\n${spec}\n\nAnswer every id, one JSON object per line.`
   const r = await $.model.complete({ model: cfg.escalateModel, system, prompt, effort: 'low', maxTokens: 60 + 60 * questions.length, timeoutMs: cfg.claudeTimeoutMs })
+  await recordModelCall($, 'judge', cfg.escalateModel, r.usage).catch(() => undefined)
   const out = new Map<string, Answer>()
   if (!r.isAnswered) return out
   const ms = (await $.clock.now()) - started

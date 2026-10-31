@@ -9,6 +9,7 @@
 - **Safer sessions.** A shell command that could wipe data, rewrite shared history or change your system is stopped before it runs, with a reason the model can act on. Approve one and Hmind learns the rule for that project, so it never asks about that shape again.
 - **Honest status, optionally enforced.** When a turn says "done" but nothing was tested, built or run, you hear about it. Turn on auto-verify and Hmind runs the project's own test or build command itself and puts the result in front of the model.
 - **Trust that calibrates itself.** A sample of the fast tier's answers is shadow-checked against Claude, every escalation compares the two for free, and your labels count too. Trust per decision kind moves up or down from that evidence, so Hmind gets sharper the more you use it.
+- **You see where the tokens go.** Every model call is written to a ledger: the main loop, each subagent, Hmind's own judge and digest calls, and the local judge, by model, with input, cache-write, cache-read and output tokens and the list-price cost of each. `/hmind usage` prints the breakdown with a savings estimate: what the trimmed output would have cost to carry through every later request, what routed subagents cost against the model they would have run on, and what Hmind's own calls cost, netted.
 - **A tool for the model too.** Claude can ask Hmind its own typed questions, batched over one state, instead of reasoning at length about each item.
 
 Everything fails open: if the judge is unavailable or unsure, Claude Code behaves exactly as it did before.
@@ -25,6 +26,7 @@ Everything fails open: if the judge is unavailable or unsure, Claude Code behave
 | Next prompt after a refusal | Is the user approving the refused command? | Learn an allow rule for that command shape in this project |
 | Next prompt once context is full | Does this prompt start a new task? | Compact at that boundary with keep rules |
 | Any time | The model calls `decide` with its own typed questions | Answers with probabilities and confidence |
+| Every model call | Who made it, on which model, at what token cost? | Adds it to the usage ledger (`/hmind usage`) |
 
 ## How it works
 
@@ -80,7 +82,8 @@ The eval scripts need Node 22.6 or newer (`node --experimental-strip-types` on 2
 
 ## Commands
 
-- `/hmind` stats: decisions per tier, latency, every action taken, calibration, trust, budget pressure, rules.
+- `/hmind` stats: decisions per tier, latency, every action taken, calibration, trust, budget pressure, rules, and this session's spend in one line.
+- `/hmind usage` the ledger for this session: tokens and list-price cost by who and model (main loop, subagents, subagents Hmind routed cheaper, compaction, Hmind's judge and digest calls, the local judge), the prompt-cache hit rate, and the savings estimate; `/hmind usage all` across sessions. Prices are list API prices; on a subscription this is plan usage, not a bill.
 - `/hmind log` the last 15 decisions with ids; `/hmind right <id>` or `/hmind wrong <id>` to label one.
 - `/hmind trust` the live trust per kind and the shadow-check evidence; `/hmind trust reset` back to the configured start.
 - `/hmind rules`, `/hmind allow <command>`, `/hmind forget <n>` for the project's allow rules.

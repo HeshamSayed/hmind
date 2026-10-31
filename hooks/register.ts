@@ -7,6 +7,7 @@
 //   4. turn.complete: flag a "done" claim made without running any check; optionally verify it.
 //   5. prompt.submit: compact at a task boundary once context is full; learn allow rules from approvals.
 //   6. agent.spawn: route lookup and mechanical subagent work to cheaper models; warn on needless forks.
+//   7. every model call: a ledger of tokens and list-price cost by who made it and on which model (/hmind usage).
 // Plus a `decide` tool the model can call itself, `/hmind` for stats and control, and a trust in the
 // local judge that recalibrates itself from shadow checks against Claude.
 // Every hook fails open: when the judge is down or unsure, nothing changes.
@@ -18,6 +19,8 @@ import type { TrustState } from './calibration'
 import { compactAtFor, describePressure, effortFor, readPressure, trimOverFor } from './budget'
 import type { Effort, Pressure, Size } from './budget'
 import { digest } from './digest'
+import { clearLedgers, ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest, resetAvoided, setLedgerSession, summarize, updateLedger } from './ledger'
+import { money } from './pricing'
 import { agrees, bumpStats, calibration, clamp, decide, decideClaude, decideOne, defaultConfig, emptyStats, loadStats, markOutcome, recordAnswers, remember } from './judge'
 import type { Answer, DecisionRecord, JudgeConfig, Question } from './judge'
 import {
@@ -90,6 +93,11 @@ type Shared = {
   root: string
   lastDeny?: { command: string; turn: number }
   verifyPrompted: boolean
+  /** subagents Hmind routed to a cheaper model: agent id -> the parent model it would have run on */
+  routed: Map<string, string>
+  /** requests made per turn, counted at turn.step */
+  steps: Map<string, number>
+  mainModel: string
 }
 
 const newId = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`
@@ -210,8 +218,8 @@ async function ensureLocal($: EngineInterface, sh: Shared): Promise<void> {
 async function registerSurface($: EngineInterface): Promise<void> {
   await $.command.register({
     name: 'hmind',
-    description: 'Hmind: stats, decisions, trust, rules, verify, on/off',
-    argumentHint: '[log|trust|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
+    description: 'Hmind: stats, usage and cost by model, decisions, trust, rules, verify, on/off',
+    argumentHint: '[usage [all]|log|trust|rules|budget|verify on|off|allow <cmd>|forget <n>|right|wrong <id>|reset|on|off]',
   })
   await $.tool.register({
     name: 'decide',
@@ -274,6 +282,7 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
   const { cfg } = sh
   const avg = (ms: number, n: number) => (n ? `${Math.round(ms / n)} ms` : 'n/a')
   const verifyOn = sh.opt.autoVerify || (await $.store.get(`verify:${sh.root}`)) === true
+  const u = summarize(await loadLedger($, 'session'))
   return [
     `Hmind ${sh.enabled ? 'on' : 'off'}: ${s.decisions} decisions (local ${s.byTier.local}, claude ${s.byTier.claude}, unanswered ${s.byTier.none}), ${s.escalations} escalations`,
     `  latency: local avg ${avg(s.localMs, s.byTier.local)}, claude avg ${avg(s.claudeMs, s.byTier.claude)}`,
@@ -281,9 +290,10 @@ async function statsText($: EngineInterface, sh: Shared): Promise<string> {
     `  calibration: ${sh.trust.checks} shadow checks, ${sh.trust.checks ? pct(sh.trust.agreements / sh.trust.checks) : 'n/a'} agreement; ${c.labeled} labeled decisions, accuracy ${pct(c.accuracy)}, calibration error ${c.ece}`,
     `  trust in the local judge: ${describeTrust(sh.trust)}`,
     `  budget: ${sh.opt.budgetMode ? describePressure(sh.pressure) || `normal (${sh.pressure.percent}% of the ${sh.pressure.window} window)` : 'budget mode off'}`,
+    `  usage this session: Claude ${money(u.claudeUsd)}${u.mainModel ? ` (${u.mainModel}, ${u.requests} requests)` : ''}, Hmind's own calls ${money(u.ownUsd)}, est. ${money(u.savedUsd)} saved at list prices; /hmind usage for the breakdown by model`,
     `  rules: ${sh.rules.filter(r => r.root === sh.root).length} learned for this project; auto-verify ${verifyOn ? 'on' : 'off'} here`,
     `  tiers: ${cfg.ollamaModel} at ${cfg.ollamaUrl} (${sh.localUp ? 'up' : 'down'}), escalation ${cfg.escalate ? cfg.escalateModel : 'off'}, confidence threshold ${cfg.confidence}, shadow rate ${sh.opt.shadowRate}`,
-    '  /hmind log | trust [reset] | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
+    '  /hmind usage [all] | log | trust [reset] | rules | allow <cmd> | forget <n> | verify on|off | right|wrong <id> | reset | on | off',
   ].join('\n')
 }
 
@@ -360,6 +370,9 @@ export const register: Register = (on, options) => {
     pressure: { level: 'normal', percent: 0, window: 'none' },
     root: '',
     verifyPrompted: false,
+    routed: new Map(),
+    steps: new Map(),
+    mainModel: '',
   }
   const { opt } = sh
   const defaults = { ...sh.trust.trust }
@@ -372,6 +385,8 @@ export const register: Register = (on, options) => {
     sh.root = await $.session.root().catch(() => e.cwd)
     sh.trust = await loadTrust($, defaults)
     sh.rules = await loadRules($)
+    const usage = await $.session.usage().catch(() => undefined)
+    setLedgerSession(String(usage?.startedAt ?? Date.now()))
     await registerSurface($)
     void ensureLocal($, sh).catch(() => undefined)
     if (opt.budgetMode) void readPressure($).then(p => (sh.pressure = p)).catch(() => undefined)
@@ -407,6 +422,11 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     let effort = e.effort
     try {
+      sh.steps.set(e.turnId, (sh.steps.get(e.turnId) ?? 0) + 1)
+      if (e.agentId === undefined) {
+        sh.mainModel = e.model
+        await recordRequest($, e.model)
+      }
       if (sh.enabled && e.agentId === undefined && e.index === 0) {
         if (opt.budgetMode) {
           sh.pressure = await readPressure($)
@@ -428,6 +448,9 @@ export const register: Register = (on, options) => {
             if (effort !== e.effort) {
               await bumpStats($, s => {
                 s.effortLowered += 1
+              })
+              await updateLedger($, l => {
+                l.notPriced.effortLowered += 1
               })
               $.ui.status(`Hmind: effort ${String(effort)} this turn (${a.tier} ${pct(a.confidence)}${sh.pressure.level !== 'normal' ? `, budget ${sh.pressure.level}` : ''})`)
             }
@@ -529,6 +552,7 @@ export const register: Register = (on, options) => {
         if (kept.length < out.length * 0.8) {
           const saved = out.length - kept.length
           sh.pendingTrims.push({ norm, id, callsLeft: 3 })
+          await recordAvoided($, saved).catch(() => undefined)
           await bumpStats($, s => {
             s.trims += 1
             s.trimmedChars += saved
@@ -570,13 +594,23 @@ export const register: Register = (on, options) => {
       s.subagentsRouted += 1
     })
     $.ui.status(`Hmind: subagent "${e.description.slice(0, 40)}" routed to ${target} (${a.tier} ${pct(a.confidence)})`)
-    return next({ ...e, model: target })
+    const spawned = await next({ ...e, model: target })
+    const agentId = (spawned as { agentId?: string }).agentId
+    if (agentId) sh.routed.set(agentId, e.parentModel)
+    return spawned
   }).catch(($, e, next) => next(e))
 
   // ------------------------------------------------------------ end of turn
 
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
+    const usage = done.usage ?? e.usage
+    const calls = sh.steps.get(e.turnId) ?? 1
+    sh.steps.delete(e.turnId)
+    if (usage) {
+      const parent = e.agentId !== undefined ? sh.routed.get(e.agentId) : undefined
+      await recordModelCall($, e.agentId === undefined ? 'main' : parent ? 'routed' : 'subagent', usage.model, usage, calls, parent).catch(() => undefined)
+    }
     if (e.agentId !== undefined || !sh.enabled) return done
     const t = sh.turns.get(e.turnId)
     sh.turns.delete(e.turnId)
@@ -648,6 +682,9 @@ export const register: Register = (on, options) => {
           await bumpStats($, s => {
             s.compactions += 1
           })
+          await updateLedger($, l => {
+            l.notPriced.compactions += 1
+          })
           $.ui.toast('Hmind: compacted the conversation at a task boundary')
         }
       }
@@ -655,10 +692,15 @@ export const register: Register = (on, options) => {
     return next(e)
   }).catch(($, e, next) => next(e))
 
-  on('session.compact', ($, e, next) => {
+  on('session.compact', async ($, e, next) => {
     if (e.agentId !== undefined || e.trigger === 'precompute') return next(e)
-    if (e.instructions?.includes(KEEP_RULES)) return next(e)
-    return next({ ...e, instructions: e.instructions ? `${e.instructions}\n\n${KEEP_RULES}` : KEEP_RULES })
+    const instructions = e.instructions?.includes(KEEP_RULES) ? e.instructions : e.instructions ? `${e.instructions}\n\n${KEEP_RULES}` : KEEP_RULES
+    const r = await next({ ...e, instructions })
+    if (!('skip' in r)) {
+      await resetAvoided($).catch(() => undefined)
+      if (r.usage) await recordModelCall($, 'compact', sh.mainModel || 'unknown', r.usage).catch(() => undefined)
+    }
+    return r
   })
 
   // ------------------------------------------------------------ the model's own tool
@@ -689,7 +731,14 @@ export const register: Register = (on, options) => {
     if (verb === 'reset') {
       await $.store.set('stats', { ...emptyStats(), enabled: sh.enabled })
       await $.store.set('recent', [])
-      return { text: 'Hmind stats cleared.' }
+      await clearLedgers($)
+      return { text: 'Hmind stats and usage ledgers cleared.' }
+    }
+    if (verb === 'usage' || verb === 'cost' || verb === 'tokens') {
+      const all = rest === 'all'
+      const led = await loadLedger($, all ? 'all' : 'session')
+      const cli = all ? undefined : (await $.session.usage().catch(() => undefined))?.cost?.usd
+      return { text: ledgerText(led, { title: all ? 'Hmind usage, all sessions' : 'Hmind usage, this session', localModel: cfg.ollamaModel, cliUsd: cli }) }
     }
     if ((verb === 'right' || verb === 'wrong') && rest) {
       const ok = await markOutcome($, rest, verb)

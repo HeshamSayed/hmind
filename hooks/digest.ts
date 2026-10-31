@@ -5,6 +5,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import type { JudgeConfig } from './judge'
+import { recordModelCall } from './ledger'
 
 const SYSTEM =
   'You compress the output of a shell command for a coding agent that must act on it. Output a digest, nothing else, in this shape:\n' +
@@ -23,6 +24,7 @@ export async function digest($: EngineInterface, cfg: JudgeConfig, command: stri
     maxTokens: 1200,
     timeoutMs: 25000,
   })
+  await recordModelCall($, 'digest', cfg.escalateModel, r.usage).catch(() => undefined)
   if (!r.isAnswered || r.text.trim().length < 10) return undefined
   return r.text.trim()
 }

@@ -1,7 +1,9 @@
 import { expect, mock, test } from 'claude-code/testing'
 
 import { compactAtFor, effortFor, levelOf, trimOverFor } from '../hooks/budget'
+import { ledgerText, loadLedger, recordAvoided, recordModelCall, recordRequest } from '../hooks/ledger'
 import { isWindowsPath, joinPath } from '../hooks/platform'
+import { money, priceOf, resolveModel, usdOf } from '../hooks/pricing'
 import { matchRule, templateOf } from '../hooks/rules'
 import { detectWith } from '../hooks/verify'
 
@@ -16,7 +18,7 @@ const ollamaReply = (letter: string) =>
     logprobs: [{ token: letter, logprob: -0.01, top_logprobs: [{ token: letter, logprob: -0.01 }, { token: letter === 'A' ? 'B' : 'A', logprob: -6 }] }],
   })
 
-type Beneath = { stdout?: string; fetch?: (e: any) => unknown; rateLimits?: { kind: string; percentUsed: number }[] }
+type Beneath = { stdout?: string; fetch?: (e: any) => unknown; complete?: () => unknown; rateLimits?: { kind: string; percentUsed: number }[] }
 
 /** The engine beneath the plugin: store and clock from memory, no Claude, a Bash that answers `stdout`, and `fetch` as given (down by default). */
 const engineBeneath = (on: any, b: Beneath = {}) => {
@@ -33,7 +35,7 @@ const engineBeneath = (on: any, b: Beneath = {}) => {
   on('command.register', () => ({ value: { command: 'hmind' } }))
   on('tool.register', () => ({ value: { tool: 'mcp__hmind__decide' } }))
   on('http.fetch', (_: unknown, e: any) => (b.fetch ?? (() => DOWN))(e))
-  on('model.complete', () => ({ value: { isAnswered: false, reason: 'api-error', status: null, error: 'unknown', usage: NO_USAGE } }))
+  on('model.complete', () => (b.complete ?? (() => ({ value: { isAnswered: false, reason: 'api-error', status: null, error: 'unknown', usage: NO_USAGE } })))())
   on('tool.call', { tool: 'Bash' }, () => ({ result: { stdout: b.stdout ?? 'ok', stderr: '', interrupted: false } }))
 }
 
@@ -183,4 +185,59 @@ test('rule templates mask numbers and ids and fold whitespace', async () => {
   expect(matchRule(rules, '/', 'kill  -9 777')).toBeDefined()
   expect(matchRule(rules, '/', 'kill -9 777 && rm -rf /')).toBeUndefined()
   expect(matchRule(rules, '/other', 'kill -9 777')).toBeUndefined()
+})
+
+test('list prices resolve aliases and price a call', async () => {
+  expect(resolveModel('haiku')).toBe('claude-haiku-5-5')
+  expect(priceOf('claude-fable-5-1')?.cacheRead).toBe(0.25)
+  expect(priceOf('claude-haiku-5-5', 200000)?.input).toBe(0.5)
+  expect(priceOf('some-other-model')).toBeUndefined()
+  expect(usdOf('claude-opus-5-5', { input_tokens: 1000000, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })).toBe(4)
+  expect(money(0.004)).toBe('<$0.01')
+  expect(money(3.456)).toBe('$3.46')
+})
+
+test('the ledger counts tokens by who and model, and prices what trimming kept out of the window', async () => {
+  const kept = new Map<string, unknown>()
+  const $ = { store: { get: async (k: string) => kept.get(k), set: async (k: string, v: unknown) => void kept.set(k, v) } } as any
+  const u = { input_tokens: 1000, output_tokens: 200, cache_read_input_tokens: 50000, cache_creation_input_tokens: 2000 }
+  await recordModelCall($, 'main', 'claude-fable-5-1', u, 3)
+  await recordModelCall($, 'routed', 'haiku', u, 2, 'claude-fable-5-1')
+  await recordAvoided($, 40000)
+  await recordRequest($, 'claude-fable-5-1')
+  await recordRequest($, 'claude-fable-5-1')
+  const led = await loadLedger($, 'all')
+  expect(led.lines['main|claude-fable-5-1']?.calls).toBe(3)
+  expect(led.lines['main|claude-fable-5-1']?.cacheRead).toBe(50000)
+  expect(led.lines['routed|claude-haiku-5-5']?.insteadUsd).toBeGreaterThan(led.lines['routed|claude-haiku-5-5']?.usd ?? 1)
+  expect(led.avoided.total).toBe(10000)
+  expect(led.avoided.rereads).toBe(2)
+  expect(led.avoided.rereadTokens).toBe(20000)
+  const text = ledgerText(led, { title: 'Hmind usage', localModel: 'qwen2.5:1.5b-instruct' })
+  expect(text.includes('main loop')).toBe(true)
+  expect(text.includes('routed by Hmind')).toBe(true)
+  expect(text.includes('10,000 tokens kept out of the context window')).toBe(true)
+  expect(text.includes('on the parent model')).toBe(true)
+})
+
+test('a judge call answered by Claude is counted with its tokens', async ($, on) => {
+  engineBeneath(on, {
+    complete: () => ({
+      value: {
+        isAnswered: true,
+        text: '{"id":"destructive","answer":"A","confidence":0.95,"why":"wipes the home directory"}',
+        usage: { input_tokens: 400, output_tokens: 30, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 },
+      },
+    }),
+  })
+  await start($)
+  const ran = await $.tool.call({ tool: 'Bash', command: 'rm -rf ~/' })
+  expect(typeof ran.deny).toBe('string')
+  const shown = (await $.command.run({ command: 'hmind', args: 'usage' })).text ?? ''
+  expect(shown.includes('Hmind judge')).toBe(true)
+  expect(shown.includes('claude-haiku-5-5')).toBe(true)
+  expect(/Hmind judge\s+claude-haiku-5-5\s+1\s+400\s+0\s+0\s+30\s+<\$0\.01/.test(shown)).toBe(true)
+  expect(shown.includes("Hmind's own Claude calls: <$0.01")).toBe(true)
+  const stats = (await $.command.run({ command: 'hmind', args: '' })).text ?? ''
+  expect(stats.includes('usage this session')).toBe(true)
 })
